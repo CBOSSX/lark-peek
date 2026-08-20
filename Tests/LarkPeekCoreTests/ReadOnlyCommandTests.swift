@@ -1,0 +1,45 @@
+import Testing
+@testable import LarkPeekCore
+
+@Test func completeCommandSurfaceIsSmallAndAuditable() throws {
+    #expect(try ReadOnlyCommand.authStatus.arguments() == ["auth", "status", "--json", "--verify"])
+    #expect(try ReadOnlyCommand.recentChats().arguments() == [
+        "im", "+chat-list", "--as", "user", "--types", "p2p,group", "--sort", "active_time", "--page-size", "100", "--format", "json"
+    ])
+    #expect(try ReadOnlyCommand.searchChats(query: "产品群").arguments() == [
+        "im", "+chat-search", "--as", "user", "--query", "产品群", "--search-types", "private,public_joined,external", "--page-size", "20", "--format", "json"
+    ])
+    #expect(try ReadOnlyCommand.recentMessages(chatID: "oc_safe").arguments() == [
+        "im", "+chat-messages-list", "--as", "user", "--chat-id", "oc_safe", "--order", "desc", "--page-size", "20", "--no-reactions", "--format", "json"
+    ])
+    #expect(try ReadOnlyCommand.recentMessages(chatID: "oc_safe", pageToken: "older-page").arguments() == [
+        "im", "+chat-messages-list", "--as", "user", "--chat-id", "oc_safe", "--order", "desc", "--page-size", "20", "--no-reactions", "--format", "json", "--page-token", "older-page"
+    ])
+}
+
+@Test func untrustedValuesCannotInjectArguments() {
+    #expect(throws: (any Error).self) { try ReadOnlyCommand.recentMessages(chatID: "oc_safe;rm").arguments() }
+    #expect(throws: (any Error).self) { try ReadOnlyCommand.recentMessages(chatID: "oc_safe", pageToken: "next\n--yes").arguments() }
+    #expect(throws: (any Error).self) { try ReadOnlyCommand.recentChats(pageToken: "next\n--yes").arguments() }
+    #expect(throws: (any Error).self) { try ReadOnlyCommand.searchChats(query: "").arguments() }
+    #expect(throws: (any Error).self) { try ReadOnlyCommand.searchChats(query: String(repeating: "x", count: 65)).arguments() }
+}
+
+@Test func allowedCommandsContainNoWriteOrGenericAPIEntrypoint() throws {
+    let commands: [ReadOnlyCommand] = [
+        .authStatus,
+        .recentChats(),
+        .recentChats(pageToken: "next"),
+        .searchChats(query: "产品群"),
+        .recentMessages(chatID: "oc_safe"),
+        .recentMessages(chatID: "oc_safe", pageToken: "older-page")
+    ]
+    let forbidden = [
+        "+messages-send", "+messages-reply", "+flag-create", "+feed-shortcut-create",
+        "create", "delete", "update", "forward", "urgent", "reactions", "--yes", "api"
+    ]
+    for arguments in try commands.map({ try $0.arguments() }) {
+        let normalized = arguments.map { $0.lowercased() }
+        for word in forbidden { #expect(!normalized.contains(word), "Unexpected write capability in \(arguments)") }
+    }
+}
