@@ -8,14 +8,18 @@ Lark Peek 是飞书桌面端的按需只读消息预览器。
 
 ## 只读边界
 
-应用只编译进四类结构化命令：
+应用只编译进六类结构化命令：
 
 - `lark-cli auth status --json --verify`
 - `lark-cli im +chat-list --as user --types p2p,group --sort active_time ...`
 - `lark-cli im +chat-search --as user --query ...`
+- `lark-cli im chats get --as user --chat-id ...`
 - `lark-cli im +chat-messages-list --as user --chat-id ... --no-reactions ...`
+- `lark-cli im +messages-resources-download --as user --message-id ... --file-key img_... --type image ...`
 
-没有 Shell 字符串拼接、任意 API 分发器或飞书写操作。附件和表情详情默认不下载，消息正文不落盘。同名会话的人工选择只保存哈希后的界面指纹到 `chat_id` 映射。
+没有 Shell 字符串拼接、任意 API 分发器或飞书写操作。只按需下载消息中的图片，不会顺带下载文件、音视频或表情详情；图片经临时文件读入内存后立即删除，消息正文不落盘。同名会话的人工选择只保存哈希后的界面指纹到 `chat_id` 映射。
+
+消息正文支持常用 Markdown（含列表、引用、标题与代码块）和 `<p>` / `<br>` 段落；可识别的互动卡片会提取标题与正文，以只读卡片样式展示。群聊名片会通过只读群信息接口补充群名。复杂卡片按钮不会执行。
 
 ## 权限
 

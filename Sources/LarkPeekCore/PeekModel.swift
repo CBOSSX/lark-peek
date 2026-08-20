@@ -133,7 +133,8 @@ public final class PeekModel: ObservableObject {
         isLoadingOlderMessages = true
         defer { isLoadingOlderMessages = false }
         do {
-            let result = try await requireClient().run(
+            let client = try requireClient()
+            let result = try await client.run(
                 .recentMessages(chatID: chat.id, pageToken: pageToken, pageSize: 20)
             )
             let page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: chat.id)
@@ -155,12 +156,17 @@ public final class PeekModel: ObservableObject {
                 hasOlderMessages = page.nextPageToken != nil
             }
             let mergedMessages = MessageTimeline.merging(page.messages, into: currentMessages)
+            let namedMessages = await resolveSharedChatNames(in: mergedMessages, using: client)
             state = .messages(
                 conversation,
                 chat,
-                mergedMessages,
+                namedMessages,
                 Date()
             )
+            let hydratedMessages = await downloadImages(in: namedMessages, using: client)
+            guard case let .messages(_, hydratedChat, _, _) = state,
+                  hydratedChat.id == chat.id else { return }
+            state = .messages(conversation, chat, hydratedMessages, Date())
             let elapsedMilliseconds = Int(Date().timeIntervalSince(startedAt) * 1_000)
             peekModelLogger.info(
                 "Loaded older messages chat=\(chat.id, privacy: .private(mask: .hash)) pageCount=\(page.messages.count) mergedCount=\(mergedMessages.count) hasMore=\(page.nextPageToken != nil) elapsedMs=\(elapsedMilliseconds)"
@@ -188,9 +194,9 @@ public final class PeekModel: ObservableObject {
         let chat = LarkChat(id: "oc_preview", name: "产品体验群", kind: .group)
         let now = Date()
         let messages = [
-            LarkMessage(id: "om_preview_1", chatID: chat.id, createTime: now.addingTimeInterval(-320), sender: MessageSender(name: "林澈"), content: "新的悬停预览已经可以体验了。"),
-            LarkMessage(id: "om_preview_2", chatID: chat.id, createTime: now.addingTimeInterval(-180), sender: MessageSender(name: "周然"), content: "鼠标停在飞书会话上，按 ⌃⌥P 就能看到最近消息。"),
-            LarkMessage(id: "om_preview_3", chatID: chat.id, createTime: now.addingTimeInterval(-45), sender: MessageSender(name: "Lark Peek"), content: "不会打开飞书会话，也没有跳转按钮。")
+            LarkMessage(id: "om_preview_1", chatID: chat.id, createTime: now.addingTimeInterval(-320), sender: MessageSender(name: "林澈"), content: "<p>新的 **Markdown** 预览已经可以体验了。</p><p>- 无序列表\n  - 嵌套列表\n> 引用内容</p>"),
+            LarkMessage(id: "om_preview_2", chatID: chat.id, type: "interactive", createTime: now.addingTimeInterval(-180), sender: MessageSender(name: "周然"), content: "**体验提醒**\n鼠标停在飞书会话上，按 ⌃⌥P 查看最近消息。"),
+            LarkMessage(id: "om_preview_3", chatID: chat.id, type: "share_chat", createTime: now.addingTimeInterval(-45), sender: MessageSender(name: "Lark Peek"), content: "分享了一个群聊", sharedChatID: "oc_preview_shared", sharedChatName: "产品设计交流群")
         ]
         state = .messages(conversation, chat, messages, now)
         statusMessage = "视觉预览模式"
@@ -286,6 +292,16 @@ public final class PeekModel: ObservableObject {
         let messages = page.messages
             .sorted(by: LarkMessage.isChronologicallyBefore)
         state = .messages(conversation, chat, messages, Date())
+        let namedMessages = await resolveSharedChatNames(in: messages, using: client)
+        try Task.checkCancellation()
+        guard case let .messages(_, namedChat, _, _) = state,
+              namedChat.id == chat.id else { return }
+        state = .messages(conversation, chat, namedMessages, Date())
+        let hydratedMessages = await downloadImages(in: namedMessages, using: client)
+        try Task.checkCancellation()
+        guard case let .messages(_, visibleChat, _, _) = state,
+              visibleChat.id == chat.id else { return }
+        state = .messages(conversation, chat, hydratedMessages, Date())
         peekModelLogger.info(
             "Loaded initial messages chat=\(chat.id, privacy: .private(mask: .hash)) count=\(messages.count) hasMore=\(page.nextPageToken != nil)"
         )
@@ -295,6 +311,136 @@ public final class PeekModel: ObservableObject {
         messageNextPageToken = nil
         hasOlderMessages = false
         isLoadingOlderMessages = false
+    }
+
+    private struct ImageRequest: Hashable, Sendable {
+        let messageID: String
+        let key: String
+    }
+
+    private func resolveSharedChatNames(
+        in messages: [LarkMessage],
+        using client: LarkCLIClient
+    ) async -> [LarkMessage] {
+        var names = Dictionary(uniqueKeysWithValues: recentChats.map { ($0.id, $0.name) })
+        for message in messages {
+            if let id = message.sharedChatID, let name = message.sharedChatName {
+                names[id] = name
+            }
+        }
+        let unresolved = Array(Set(messages.compactMap { message -> String? in
+            guard let id = message.sharedChatID, names[id] == nil else { return nil }
+            return id
+        }))
+
+        for start in stride(from: 0, to: unresolved.count, by: 3) {
+            if Task.isCancelled { return messages }
+            let batch = Array(unresolved[start..<min(start + 3, unresolved.count)])
+            let chats = await withTaskGroup(of: LarkChat?.self) { group in
+                for chatID in batch {
+                    group.addTask {
+                        guard let result = try? await client.run(.chatDetails(chatID: chatID)) else { return nil }
+                        return try? LarkCLIParser.chatDetails(from: result.data, chatID: chatID)
+                    }
+                }
+                var values: [LarkChat] = []
+                for await value in group {
+                    if let value { values.append(value) }
+                }
+                return values
+            }
+            mergeChats(chats)
+            for chat in chats { names[chat.id] = chat.name }
+        }
+
+        return messages.map { message in
+            var message = message
+            if let id = message.sharedChatID { message.sharedChatName = names[id] }
+            return message
+        }
+    }
+
+    private struct ImageDownload: Sendable {
+        let data: Data?
+    }
+
+    private func downloadImages(in messages: [LarkMessage], using client: LarkCLIClient) async -> [LarkMessage] {
+        let requests = messages.flatMap { message in
+            message.images.compactMap { image in
+                image.data == nil && !image.attempted
+                    ? ImageRequest(messageID: message.id, key: image.key)
+                    : nil
+            }
+        }
+        guard !requests.isEmpty else { return messages }
+
+        var downloaded: [ImageRequest: ImageDownload] = [:]
+        let workingDirectory = self.workingDirectory
+        for start in stride(from: 0, to: requests.count, by: 3) {
+            if Task.isCancelled { return messages }
+            let batch = Array(requests[start..<min(start + 3, requests.count)])
+            let results = await withTaskGroup(of: (ImageRequest, ImageDownload).self) { group in
+                for request in batch {
+                    group.addTask {
+                        let data = await Self.downloadImage(
+                            request,
+                            using: client,
+                            workingDirectory: workingDirectory
+                        )
+                        return (request, ImageDownload(data: data))
+                    }
+                }
+                var values: [(ImageRequest, ImageDownload)] = []
+                for await value in group { values.append(value) }
+                return values
+            }
+            for (request, download) in results { downloaded[request] = download }
+        }
+
+        return messages.map { message in
+            var message = message
+            message.images = message.images.map { image in
+                let request = ImageRequest(messageID: message.id, key: image.key)
+                guard let result = downloaded[request] else { return image }
+                return MessageImage(key: image.key, data: result.data, attempted: true)
+            }
+            return message
+        }
+    }
+
+    private nonisolated static func downloadImage(
+        _ request: ImageRequest,
+        using client: LarkCLIClient,
+        workingDirectory: URL
+    ) async -> Data? {
+        let digest = SHA256.hash(data: Data("\(request.messageID):\(request.key)".utf8))
+        let filename = "lark-peek-image-"
+            + digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+            + "-" + UUID().uuidString + ".image"
+        let requestedURL = workingDirectory.appendingPathComponent(filename)
+        defer { try? FileManager.default.removeItem(at: requestedURL) }
+        do {
+            let result = try await client.run(.messageImage(
+                messageID: request.messageID,
+                fileKey: request.key,
+                outputPath: filename
+            ))
+            let savedPath = try LarkCLIParser.downloadedResourcePath(from: result.data)
+            let fileURL = URL(fileURLWithPath: savedPath, relativeTo: workingDirectory).standardizedFileURL
+            let rootPath = workingDirectory.standardizedFileURL.path
+            guard fileURL.path == rootPath || fileURL.path.hasPrefix(rootPath + "/") else { return nil }
+            defer { try? FileManager.default.removeItem(at: fileURL) }
+            let values = try fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+            guard values.isRegularFile == true, let size = values.fileSize, size <= 15 * 1_024 * 1_024 else {
+                return nil
+            }
+            return try Data(contentsOf: fileURL)
+        } catch {
+            peekModelLogger.debug(
+                "Image download unavailable message=\(request.messageID, privacy: .private(mask: .hash)) key=\(request.key, privacy: .private(mask: .hash)) error=\(error.localizedDescription, privacy: .private)"
+            )
+            return nil
+        }
     }
 
     private func mappingKey(for conversation: HoveredConversation) -> String {

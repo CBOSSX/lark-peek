@@ -56,6 +56,18 @@ public struct MessageSender: Codable, Hashable, Sendable {
     }
 }
 
+public struct MessageImage: Codable, Hashable, Sendable {
+    public let key: String
+    public var data: Data?
+    public var attempted: Bool
+
+    public init(key: String, data: Data? = nil, attempted: Bool = false) {
+        self.key = key
+        self.data = data
+        self.attempted = attempted
+    }
+}
+
 public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
     public let id: String
     public var chatID: String
@@ -64,6 +76,9 @@ public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
     public var position: Int64?
     public var sender: MessageSender
     public var content: String
+    public var images: [MessageImage]
+    public var sharedChatID: String?
+    public var sharedChatName: String?
     public var deleted: Bool
     public var updated: Bool
 
@@ -75,6 +90,9 @@ public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
         position: Int64? = nil,
         sender: MessageSender,
         content: String,
+        images: [MessageImage] = [],
+        sharedChatID: String? = nil,
+        sharedChatName: String? = nil,
         deleted: Bool = false,
         updated: Bool = false
     ) {
@@ -85,6 +103,9 @@ public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
         self.position = position
         self.sender = sender
         self.content = content
+        self.images = images
+        self.sharedChatID = sharedChatID
+        self.sharedChatName = sharedChatName
         self.deleted = deleted
         self.updated = updated
     }

@@ -38,11 +38,74 @@ import Testing
 }
 
 @Test func rendersResourcePlaceholdersWithoutDownloading() throws {
-    let json = #"{"ok":true,"data":{"messages":[{"message_id":"om_image","msg_type":"image","create_time":"1786400000000","sender":{"name":"A"},"content":"{\"image_key\":\"img_safe\"}"},{"message_id":"om_file","msg_type":"file","create_time":"1786400000001","sender":{"name":"A"},"content":"{\"file_name\":\"plan.pdf\"}"}]}}"#
+    let json = #"{"ok":true,"data":{"messages":[{"message_id":"om_image","msg_type":"image","create_time":"1786400000000","sender":{"name":"A"},"content":"{\"image_key\":\"img_safe\"}"},{"message_id":"om_marker","msg_type":"text","create_time":"1786400000001","sender":{"name":"A"},"content":"[Image: img_v3_from_cli]"},{"message_id":"om_file","msg_type":"file","create_time":"1786400000002","sender":{"name":"A"},"content":"{\"file_name\":\"plan.pdf\"}"}]}}"#
     let messages = try LarkCLIParser.messages(from: Data(json.utf8), fallbackChatID: "oc_1")
 
     #expect(messages[0].content == "[图片]")
-    #expect(messages[1].content == "附件：plan.pdf")
+    #expect(messages[0].images.map(\.key) == ["img_safe"])
+    #expect(messages[1].content == "[图片]")
+    #expect(messages[1].images.map(\.key) == ["img_v3_from_cli"])
+    #expect(messages[2].content == "附件：plan.pdf")
+}
+
+@Test func extractsInteractiveCardTextAndSharedChatMetadata() throws {
+    let json = #"{"ok":true,"data":{"messages":[{"message_id":"om_card","msg_type":"interactive","content":"{\"header\":{\"title\":{\"tag\":\"plain_text\",\"content\":\"审批提醒\"}},\"elements\":[{\"tag\":\"div\",\"text\":{\"tag\":\"lark_md\",\"content\":\"**请尽快处理**\"}}]}"},{"message_id":"om_chat","msg_type":"share_chat","content":"[Chat card: oc_shared_123]"}]}}"#
+    let messages = try LarkCLIParser.messages(from: Data(json.utf8), fallbackChatID: "oc_1")
+
+    #expect(messages[0].content == "审批提醒\n**请尽快处理**")
+    #expect(messages[1].sharedChatID == "oc_shared_123")
+}
+
+@Test func removesCardMarkupAndMentionIDs() throws {
+    let json = #"{"ok":true,"data":{"messages":[{"message_id":"om_xml_card","msg_type":"interactive","content":"<card title=\"文档内容变更提醒\">\n@王淼 (ou_572cbf21d8d54a4bc69de598df27f44e) 编辑了文档 [来啦！](https://example.com)\n[查看变更详情](https://example.com/detail) [取消关注]\n</card>"}]}}"#
+    let message = try #require(LarkCLIParser.messages(from: Data(json.utf8), fallbackChatID: "oc_1").first)
+
+    #expect(message.content == "**文档内容变更提醒**\n@王淼 编辑了文档 [来啦！](https://example.com)\n[查看变更详情](https://example.com/detail) [取消关注]")
+    #expect(!message.content.contains("<card"))
+    #expect(!message.content.contains("ou_"))
+}
+
+@Test func parsesSharedChatDetails() throws {
+    let json = #"{"ok":true,"data":{"name":"真实群名","description":"群描述","chat_mode":"group","external":false}}"#
+    let chat = try LarkCLIParser.chatDetails(from: Data(json.utf8), chatID: "oc_shared")
+    #expect(chat.name == "真实群名")
+    #expect(chat.id == "oc_shared")
+}
+
+@Test func parsesDownloadedResourcePath() throws {
+    let json = #"{"ok":true,"data":{"saved_path":"lark-peek-image-safe.png","size_bytes":42}}"#
+    #expect(try LarkCLIParser.downloadedResourcePath(from: Data(json.utf8)) == "lark-peek-image-safe.png")
+}
+
+@Test func rendersMessageMarkdownAndPreservesWhitespace() throws {
+    let markdown = "**重点**\n[文档](https://example.com) 和 `代码`"
+    let rendered = MessageMarkdown.attributedString(from: markdown)
+
+    #expect(String(rendered.characters) == "重点\n文档 和 代码")
+
+    let runs = Array(rendered.runs)
+    #expect(runs.contains { $0.inlinePresentationIntent?.contains(.stronglyEmphasized) == true })
+    #expect(runs.contains { $0.inlinePresentationIntent?.contains(.code) == true })
+    #expect(runs.contains { $0.link?.absoluteString == "https://example.com" })
+}
+
+@Test func rendersHTMLParagraphsAsReadableText() {
+    let rendered = MessageMarkdown.attributedString(from: "<p>第一段</p><p>第二段<br>下一行 &amp; 更多</p>")
+    #expect(String(rendered.characters) == "第一段\n\n第二段\n下一行 & 更多")
+}
+
+@Test func parsesMarkdownListsQuotesHeadingsAndCodeBlocks() {
+    let markdown = "- 测试 md\n- hhh\n  - 111\n1. aaa\n> 急急急\n>> 积极\n# 标题\n```\nlet x = 1\n```"
+    let blocks = MessageMarkdown.blocks(from: markdown)
+
+    #expect(blocks.map(\.kind) == [
+        .unordered(level: 0), .unordered(level: 0), .unordered(level: 1),
+        .ordered(number: 1, level: 0), .quote(level: 0), .quote(level: 1),
+        .heading(level: 1), .code
+    ])
+    #expect(blocks.map(\.content) == [
+        "测试 md", "hhh", "111", "aaa", "急急急", "积极", "标题", "let x = 1"
+    ])
 }
 
 @Test func chatMatcherPrefersNormalizedExactNames() {

@@ -56,8 +56,29 @@ public enum LarkCLIParser {
         try chatPage(from: data).chats
     }
 
+    public static func chatDetails(from data: Data, chatID: String) throws -> LarkChat {
+        guard validChatID(chatID) != nil else { throw LarkCLIError.malformedResponse }
+        let root = try payload(from: data)
+        let name = (root["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return LarkChat(
+            id: chatID,
+            name: name?.isEmpty == false ? name! : "未命名群聊",
+            description: root["description"] as? String,
+            kind: ChatKind(chatMode: root["chat_mode"] as? String),
+            external: root["external"] as? Bool ?? false
+        )
+    }
+
     public static func messages(from data: Data, fallbackChatID: String) throws -> [LarkMessage] {
         try messagePage(from: data, fallbackChatID: fallbackChatID).messages
+    }
+
+    public static func downloadedResourcePath(from data: Data) throws -> String {
+        let root = try payload(from: data)
+        guard let path = root["saved_path"] as? String, !path.isEmpty else {
+            throw LarkCLIError.malformedResponse
+        }
+        return path
     }
 
     public static func messagePage(from data: Data, fallbackChatID: String) throws -> MessagePage {
@@ -96,6 +117,7 @@ public enum LarkCLIParser {
         let type = row["msg_type"] as? String ?? "text"
         let rawContent = stringify(row["content"])
         let deleted = row["deleted"] as? Bool ?? false
+        let parsedContent = readableContent(rawContent, type: type)
         return LarkMessage(
             id: id,
             chatID: row["chat_id"] as? String ?? fallbackChatID,
@@ -103,7 +125,10 @@ public enum LarkCLIParser {
             createTime: parseDate(row["create_time"]),
             position: parseInt64(row["message_position"]),
             sender: sender,
-            content: deleted ? "这条消息已撤回" : readableContent(rawContent, type: type),
+            content: deleted ? "这条消息已撤回" : parsedContent.text,
+            images: deleted ? [] : parsedContent.imageKeys.map { MessageImage(key: $0) },
+            sharedChatID: deleted ? nil : parsedContent.sharedChatID,
+            sharedChatName: deleted ? nil : parsedContent.sharedChatName,
             deleted: deleted,
             updated: row["updated"] as? Bool ?? false
         )
@@ -158,20 +183,176 @@ public enum LarkCLIParser {
         Date(timeIntervalSince1970: value > 10_000_000_000 ? value / 1_000 : value)
     }
 
-    private static func readableContent(_ raw: String, type: String) -> String {
+    private struct ReadableContent {
+        let text: String
+        let imageKeys: [String]
+        let sharedChatID: String?
+        let sharedChatName: String?
+    }
+
+    private static func readableContent(_ raw: String, type: String) -> ReadableContent {
+        if type == "interactive", let markup = cardMarkup(in: raw) {
+            return ReadableContent(
+                text: markup,
+                imageKeys: imageKeys(in: raw),
+                sharedChatID: sharedChatID(in: raw),
+                sharedChatName: nil
+            )
+        }
         guard let data = raw.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return raw.isEmpty ? placeholder(for: type) : normalizeMarkers(raw) }
-        if let text = object["text"] as? String { return normalizeMarkers(text) }
-        if let title = object["file_name"] as? String { return "附件：\(title)" }
-        if let title = object["title"] as? String, !title.isEmpty { return title }
-        return placeholder(for: type)
+        else {
+            return ReadableContent(
+                text: raw.isEmpty ? placeholder(for: type) : normalizeMarkers(raw),
+                imageKeys: imageKeys(in: raw),
+                sharedChatID: sharedChatID(in: raw),
+                sharedChatName: nil
+            )
+        }
+
+        let images = imageKeys(in: object)
+        let sharedChatID = (object["chat_id"] as? String).flatMap(validChatID)
+            ?? sharedChatID(in: raw)
+        let text: String
+        if type == "interactive", let cardText = cardText(in: object) {
+            text = cardText
+        } else if let value = object["text"] as? String {
+            text = normalizeMarkers(value)
+        } else if let title = object["file_name"] as? String {
+            text = "附件：\(title)"
+        } else if let title = object["title"] as? String, !title.isEmpty {
+            text = title
+        } else if sharedChatID != nil || type == "share_chat" {
+            text = "分享了一个群聊"
+        } else {
+            text = placeholder(for: type)
+        }
+        let sharedChatName = (object["chat_name"] as? String) ?? (object["name"] as? String)
+        return ReadableContent(
+            text: text,
+            imageKeys: images,
+            sharedChatID: sharedChatID,
+            sharedChatName: sharedChatName
+        )
     }
 
     private static func normalizeMarkers(_ text: String) -> String {
-        text
+        let normalized = text
             .replacingOccurrences(of: #"!\[Image\]\(img_[A-Za-z0-9_-]+\)"#, with: "[图片]", options: .regularExpression)
+            .replacingOccurrences(of: #"\[Image:\s*img_[A-Za-z0-9_-]+\]"#, with: "[图片]", options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: #"\[Image\]\(img_[A-Za-z0-9_-]+\)"#, with: "[图片]", options: [.regularExpression, .caseInsensitive])
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? "[图片]" : normalized
+    }
+
+    private static func cardMarkup(in text: String) -> String? {
+        guard text.range(of: #"<\s*card\b"#, options: [.regularExpression, .caseInsensitive]) != nil else {
+            return nil
+        }
+        let title = matches(
+            in: text,
+            pattern: #"<\s*card\b[^>]*\btitle\s*=\s*[\"']([^\"']*)[\"'][^>]*>"#,
+            captureGroup: 1
+        ).first
+        var body = text
+            .replacingOccurrences(of: #"<\s*card\b[^>]*>"#, with: "", options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: #"<\s*/\s*card\s*>"#, with: "", options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: #"<\s*br\s*/?\s*>"#, with: "\n", options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"\s*\(ou_[A-Za-z0-9_-]+\)"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        body = decodeBasicEntities(in: body)
+        let titleText = title.map { decodeBasicEntities(in: $0) }?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return [titleText.map { "**\($0)**" }, body.isEmpty ? nil : body]
+            .compactMap { $0 }
+            .joined(separator: "\n")
+    }
+
+    private static func decodeBasicEntities(in text: String) -> String {
+        text
+            .replacingOccurrences(of: "&nbsp;", with: " ", options: .caseInsensitive)
+            .replacingOccurrences(of: "&lt;", with: "<", options: .caseInsensitive)
+            .replacingOccurrences(of: "&gt;", with: ">", options: .caseInsensitive)
+            .replacingOccurrences(of: "&quot;", with: "\"", options: .caseInsensitive)
+            .replacingOccurrences(of: "&#39;", with: "'", options: .caseInsensitive)
+            .replacingOccurrences(of: "&amp;", with: "&", options: .caseInsensitive)
+    }
+
+    private static func imageKeys(in value: Any) -> [String] {
+        var keys: [String] = []
+        func collect(_ value: Any) {
+            if let dictionary = value as? [String: Any] {
+                if let key = dictionary["image_key"] as? String, validImageKey(key) != nil {
+                    keys.append(key)
+                }
+                for nested in dictionary.values { collect(nested) }
+            } else if let array = value as? [Any] {
+                for nested in array { collect(nested) }
+            } else if let string = value as? String {
+                keys.append(contentsOf: imageKeys(in: string))
+            }
+        }
+        collect(value)
+        return keys.reduce(into: []) { result, key in
+            if !result.contains(key) { result.append(key) }
+        }
+    }
+
+    private static func imageKeys(in text: String) -> [String] {
+        matches(in: text, pattern: #"img_[A-Za-z0-9_-]+"#)
+            .compactMap(validImageKey)
+    }
+
+    private static func sharedChatID(in text: String) -> String? {
+        matches(in: text, pattern: #"\[Chat card:\s*(oc_[A-Za-z0-9_-]+)\]"#, captureGroup: 1)
+            .compactMap(validChatID)
+            .first
+    }
+
+    private static func validImageKey(_ value: String) -> String? {
+        value.range(of: #"^img_[A-Za-z0-9_-]+$"#, options: .regularExpression) == nil ? nil : value
+    }
+
+    private static func validChatID(_ value: String) -> String? {
+        value.range(of: #"^oc_[A-Za-z0-9_-]+$"#, options: .regularExpression) == nil ? nil : value
+    }
+
+    private static func matches(in text: String, pattern: String, captureGroup: Int = 0) -> [String] {
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(text.startIndex..., in: text)
+        return expression.matches(in: text, range: range).compactMap { match in
+            guard captureGroup < match.numberOfRanges,
+                  let range = Range(match.range(at: captureGroup), in: text) else { return nil }
+            return String(text[range])
+        }
+    }
+
+    private static func cardText(in object: [String: Any]) -> String? {
+        var parts: [String] = []
+        var seen: Set<String> = []
+        func append(_ value: String) {
+            let normalized = normalizeMarkers(value)
+            guard !normalized.isEmpty, seen.insert(normalized).inserted else { return }
+            parts.append(normalized)
+        }
+        func collect(_ value: Any) {
+            if let dictionary = value as? [String: Any] {
+                if let content = dictionary["content"] as? String { append(content) }
+                if let text = dictionary["text"] as? String { append(text) }
+                if let title = dictionary["title"] as? String { append(title) }
+                let orderedKeys = ["title", "text", "fields", "elements", "actions", "columns", "body"]
+                for key in orderedKeys {
+                    if let nested = dictionary[key], !(nested is String) { collect(nested) }
+                }
+            } else if let array = value as? [Any] {
+                for nested in array { collect(nested) }
+            }
+        }
+        if let header = object["header"] { collect(header) }
+        if let body = object["body"] { collect(body) }
+        if let elements = object["elements"] { collect(elements) }
+        if parts.isEmpty { collect(object) }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n")
     }
 
     private static func placeholder(for type: String) -> String {

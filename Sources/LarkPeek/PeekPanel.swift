@@ -582,11 +582,7 @@ private struct MessageTimelineView: View {
                     }
                     Spacer()
                 }
-                Text(message.content)
-                    .font(.system(size: 13))
-                    .lineSpacing(3)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
+                MessageContentView(message: message)
             }
         }
         .padding(11)
@@ -604,6 +600,173 @@ private struct MessageTimelineView: View {
         formatter.dateFormat = "MM-dd HH:mm"
         return formatter
     }()
+}
+
+private struct MessageContentView: View {
+    let message: LarkMessage
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if message.sharedChatID != nil {
+                sharedChatCard
+            } else if message.type == "interactive" {
+                interactiveCard
+            } else if !displayContent.isEmpty {
+                markdownText(displayContent)
+            }
+
+            ForEach(message.images, id: \.key) { image in
+                messageImage(image)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var interactiveCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("互动卡片", systemImage: "rectangle.on.rectangle.angled")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.blue)
+            if displayContent == "[互动卡片]" {
+                Text("这张卡片暂时没有可提取的文本内容")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            } else {
+                markdownText(displayContent)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.blue.opacity(0.18), lineWidth: 1)
+        }
+    }
+
+    private var sharedChatCard: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "person.3.fill")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 34, height: 34)
+                .background(Color.teal.gradient, in: RoundedRectangle(cornerRadius: 9))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(message.sharedChatName ?? "群聊名片")
+                    .font(.system(size: 12, weight: .semibold))
+                Text(message.sharedChatName == nil ? "分享了一个群聊" : "群聊名片")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.teal.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func markdownText(_ content: String) -> some View {
+        MarkdownMessageView(content: content)
+    }
+
+    private var displayContent: String {
+        guard !message.images.isEmpty else { return message.content }
+        return message.content
+            .replacingOccurrences(of: "[图片]", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    @ViewBuilder
+    private func messageImage(_ image: MessageImage) -> some View {
+        if let data = image.data, let image = NSImage(data: data) {
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: 300, maxHeight: 240)
+                .clipShape(RoundedRectangle(cornerRadius: 9))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 9)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                }
+        } else if image.attempted {
+            Label("图片暂不可用", systemImage: "photo.badge.exclamationmark")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        } else {
+            HStack(spacing: 7) {
+                ProgressView().controlSize(.small)
+                Text("正在加载图片…")
+            }
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct MarkdownMessageView: View {
+    let content: String
+
+    private var blocks: [MessageMarkdown.Block] {
+        MessageMarkdown.blocks(from: content)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                blockView(block)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder
+    private func blockView(_ block: MessageMarkdown.Block) -> some View {
+        switch block.kind {
+        case .paragraph:
+            inlineText(block.content)
+
+        case let .heading(level):
+            inlineText(block.content)
+                .font(.system(size: max(13, 18 - CGFloat(level)), weight: .bold))
+
+        case let .unordered(level):
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("•").frame(width: 10, alignment: .trailing)
+                inlineText(block.content)
+            }
+            .padding(.leading, CGFloat(level * 14))
+
+        case let .ordered(number, level):
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("\(number).").frame(minWidth: 16, alignment: .trailing)
+                inlineText(block.content)
+            }
+            .padding(.leading, CGFloat(level * 14))
+
+        case let .quote(level):
+            HStack(alignment: .top, spacing: 8) {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.45))
+                    .frame(width: 3)
+                inlineText(block.content).foregroundStyle(.secondary)
+            }
+            .padding(.leading, CGFloat(level * 12))
+
+        case .code:
+            Text(block.content)
+                .font(.system(size: 12, design: .monospaced))
+                .textSelection(.enabled)
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 7))
+        }
+    }
+
+    private func inlineText(_ value: String) -> some View {
+        Text(MessageMarkdown.attributedString(from: value))
+            .font(.system(size: 13))
+            .lineSpacing(3)
+            .textSelection(.enabled)
+    }
 }
 
 /// Circular avatar with the sender's initial, tinted by a stable per-sender color.

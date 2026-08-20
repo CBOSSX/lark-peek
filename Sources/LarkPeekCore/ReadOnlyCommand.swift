@@ -4,12 +4,16 @@ public enum CommandPolicyError: LocalizedError, Equatable {
     case invalidIdentifier
     case invalidPageToken
     case invalidQuery
+    case invalidResourceKey
+    case invalidOutputPath
 
     public var errorDescription: String? {
         switch self {
         case .invalidIdentifier: "会话标识符格式不合法，命令未执行。"
         case .invalidPageToken: "分页令牌格式不合法，命令未执行。"
         case .invalidQuery: "会话名称不适合搜索，命令未执行。"
+        case .invalidResourceKey: "图片资源标识符格式不合法，命令未执行。"
+        case .invalidOutputPath: "图片临时路径不安全，命令未执行。"
         }
     }
 }
@@ -17,13 +21,17 @@ public enum CommandPolicyError: LocalizedError, Equatable {
 /// The entire server-facing surface of Lark Peek.
 ///
 /// Keeping this as a closed enum makes it impossible for UI input to dispatch
-/// arbitrary lark-cli operations. Every case below is classified `Risk: read`
-/// by lark-cli 1.0.88.
+/// arbitrary lark-cli operations. Every case below is server-side read-only.
+/// The image resource command is classified as a local write because it uses a
+/// temporary output file; the app removes that file immediately after reading it.
 public enum ReadOnlyCommand: Equatable, Sendable {
     case authStatus
     case recentChats(pageToken: String? = nil, pageSize: Int = 100)
     case searchChats(query: String, pageSize: Int = 20)
+    case chatDetails(chatID: String)
     case recentMessages(chatID: String, pageToken: String? = nil, pageSize: Int = 20)
+    /// Performs a server-side GET and writes only to an app-controlled temporary file.
+    case messageImage(messageID: String, fileKey: String, outputPath: String)
 
     public func arguments() throws -> [String] {
         switch self {
@@ -56,6 +64,15 @@ public enum ReadOnlyCommand: Equatable, Sendable {
                 "--format", "json"
             ]
 
+        case let .chatDetails(chatID):
+            try validateChatID(chatID)
+            return [
+                "im", "chats", "get",
+                "--as", "user",
+                "--chat-id", chatID,
+                "--format", "json"
+            ]
+
         case let .recentMessages(chatID, pageToken, pageSize):
             try validateChatID(chatID)
             var arguments = [
@@ -69,6 +86,24 @@ public enum ReadOnlyCommand: Equatable, Sendable {
             ]
             try appendPageToken(pageToken, to: &arguments)
             return arguments
+
+        case let .messageImage(messageID, fileKey, outputPath):
+            try validateMessageID(messageID)
+            try validateImageKey(fileKey)
+            guard !outputPath.isEmpty, outputPath.count <= 512,
+                  !outputPath.contains("/"), !outputPath.contains("\\"),
+                  !outputPath.contains(".."), !outputPath.contains("\0") else {
+                throw CommandPolicyError.invalidOutputPath
+            }
+            return [
+                "im", "+messages-resources-download",
+                "--as", "user",
+                "--message-id", messageID,
+                "--file-key", fileKey,
+                "--type", "image",
+                "--output", outputPath,
+                "--format", "json"
+            ]
         }
     }
 
@@ -86,6 +121,24 @@ public enum ReadOnlyCommand: Equatable, Sendable {
               value.unicodeScalars.allSatisfy(allowed.contains) else {
             throw CommandPolicyError.invalidIdentifier
         }
+    }
+
+    private func validateMessageID(_ value: String) throws {
+        guard isSafeIdentifier(value, prefix: "om_") else {
+            throw CommandPolicyError.invalidIdentifier
+        }
+    }
+
+    private func validateImageKey(_ value: String) throws {
+        guard isSafeIdentifier(value, prefix: "img_") else {
+            throw CommandPolicyError.invalidResourceKey
+        }
+    }
+
+    private func isSafeIdentifier(_ value: String, prefix: String) -> Bool {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-"))
+        return value.hasPrefix(prefix) && value.count <= 512
+            && value.unicodeScalars.allSatisfy(allowed.contains)
     }
 }
 
