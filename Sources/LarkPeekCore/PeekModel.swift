@@ -1,6 +1,9 @@
 import Combine
 import CryptoKit
 import Foundation
+import OSLog
+
+private let peekModelLogger = Logger(subsystem: "io.github.cbossx.larkpeek", category: "Pagination")
 
 public enum PeekState: Equatable {
     case waiting
@@ -110,10 +113,23 @@ public final class PeekModel: ObservableObject {
     }
 
     public func loadOlderMessages() async {
-        guard !isLoadingOlderMessages,
-              let pageToken = messageNextPageToken,
-              case let .messages(conversation, chat, currentMessages, _) = state else { return }
+        guard !isLoadingOlderMessages else {
+            peekModelLogger.debug("Ignoring older-message request: a page is already loading")
+            return
+        }
+        guard let pageToken = messageNextPageToken else {
+            peekModelLogger.debug("Ignoring older-message request: no next-page token")
+            return
+        }
+        guard case let .messages(conversation, chat, currentMessages, _) = state else {
+            peekModelLogger.debug("Ignoring older-message request: timeline is not visible")
+            return
+        }
 
+        let startedAt = Date()
+        peekModelLogger.info(
+            "Loading older messages chat=\(chat.id, privacy: .private(mask: .hash)) token=\(pageToken, privacy: .private(mask: .hash)) currentCount=\(currentMessages.count)"
+        )
         isLoadingOlderMessages = true
         defer { isLoadingOlderMessages = false }
         do {
@@ -123,19 +139,41 @@ public final class PeekModel: ObservableObject {
             let page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: chat.id)
             try Task.checkCancellation()
             guard case let .messages(_, visibleChat, _, _) = state,
-                  visibleChat.id == chat.id else { return }
+                  visibleChat.id == chat.id else {
+                peekModelLogger.debug("Discarding older-message page because the visible chat changed")
+                return
+            }
 
-            messageNextPageToken = page.nextPageToken
-            hasOlderMessages = page.nextPageToken != nil
+            if page.nextPageToken == pageToken {
+                peekModelLogger.error(
+                    "Stopping pagination because the server repeated the same page token chat=\(chat.id, privacy: .private(mask: .hash))"
+                )
+                messageNextPageToken = nil
+                hasOlderMessages = false
+            } else {
+                messageNextPageToken = page.nextPageToken
+                hasOlderMessages = page.nextPageToken != nil
+            }
+            let mergedMessages = MessageTimeline.merging(page.messages, into: currentMessages)
             state = .messages(
                 conversation,
                 chat,
-                MessageTimeline.merging(page.messages, into: currentMessages),
+                mergedMessages,
                 Date()
             )
+            let elapsedMilliseconds = Int(Date().timeIntervalSince(startedAt) * 1_000)
+            peekModelLogger.info(
+                "Loaded older messages chat=\(chat.id, privacy: .private(mask: .hash)) pageCount=\(page.messages.count) mergedCount=\(mergedMessages.count) hasMore=\(page.nextPageToken != nil) elapsedMs=\(elapsedMilliseconds)"
+            )
         } catch is CancellationError {
+            peekModelLogger.debug(
+                "Older-message request cancelled chat=\(chat.id, privacy: .private(mask: .hash))"
+            )
             return
         } catch {
+            peekModelLogger.error(
+                "Older-message request failed chat=\(chat.id, privacy: .private(mask: .hash)) error=\(error.localizedDescription, privacy: .private)"
+            )
             statusMessage = "加载更早消息失败：\(error.localizedDescription)"
         }
     }
@@ -248,6 +286,9 @@ public final class PeekModel: ObservableObject {
         let messages = page.messages
             .sorted(by: LarkMessage.isChronologicallyBefore)
         state = .messages(conversation, chat, messages, Date())
+        peekModelLogger.info(
+            "Loaded initial messages chat=\(chat.id, privacy: .private(mask: .hash)) count=\(messages.count) hasMore=\(page.nextPageToken != nil)"
+        )
     }
 
     private func resetMessagePagination() {

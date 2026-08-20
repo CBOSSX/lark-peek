@@ -168,7 +168,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         optionHoldTask = nil
         isOptionPeekActive = false
         peekTask?.cancel()
-        model.dismiss()
+        // The controller dismisses the model after the fly-out animation finishes.
         panelController.close()
     }
 
