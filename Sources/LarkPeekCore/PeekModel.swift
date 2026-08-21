@@ -4,6 +4,7 @@ import Foundation
 import OSLog
 
 private let peekModelLogger = Logger(subsystem: "io.github.cbossx.larkpeek", category: "Pagination")
+private let chatMatchLogger = Logger(subsystem: "io.github.cbossx.larkpeek", category: "ChatMatching")
 
 public enum PeekState: Equatable {
     case waiting
@@ -52,15 +53,41 @@ public final class PeekModel: ObservableObject {
                 return
             }
 
-            var matches = ChatMatcher.matches(name: conversation.name, in: recentChats)
+            var matches = ChatMatcher.exactMatches(name: conversation.name, in: recentChats)
+            chatMatchLogger.info(
+                "Checked cached chats target=\(conversation.name, privacy: .private(mask: .hash)) cachedCount=\(self.recentChats.count) exactCount=\(matches.count)"
+            )
             if matches.isEmpty {
+                // The activity-sorted first page is only a startup snapshot. A
+                // newly active P2P chat may have moved into it since prewarming.
+                try await loadFirstChatPage(using: client)
+                matches = ChatMatcher.exactMatches(name: conversation.name, in: recentChats)
+                chatMatchLogger.info(
+                    "Refreshed recent chats target=\(conversation.name, privacy: .private(mask: .hash)) refreshedCount=\(self.recentChats.count) exactCount=\(matches.count)"
+                )
+            }
+            if matches.isEmpty {
+                matches = try await findExactByPagingRecentChats(name: conversation.name, using: client)
+                chatMatchLogger.info(
+                    "Finished exact paged lookup target=\(conversation.name, privacy: .private(mask: .hash)) indexedCount=\(self.recentChats.count) exactCount=\(matches.count)"
+                )
+            }
+            if matches.isEmpty {
+                // +chat-search only searches groups. Its fuzzy results must not
+                // prevent a P2P exact match from being found in chat-list pages.
                 let result = try await client.run(.searchChats(query: conversation.name, pageSize: 30))
                 let searched = try LarkCLIParser.chats(from: result.data)
                 mergeChats(searched)
-                matches = ChatMatcher.matches(name: conversation.name, in: searched)
+                matches = ChatMatcher.exactMatches(name: conversation.name, in: searched)
+                chatMatchLogger.info(
+                    "Checked group search target=\(conversation.name, privacy: .private(mask: .hash)) searchedCount=\(searched.count) exactCount=\(matches.count)"
+                )
             }
             if matches.isEmpty {
-                matches = try await findByPagingRecentChats(name: conversation.name, using: client)
+                matches = ChatMatcher.fuzzyMatches(name: conversation.name, in: recentChats)
+                chatMatchLogger.info(
+                    "Falling back to fuzzy candidates target=\(conversation.name, privacy: .private(mask: .hash)) candidateCount=\(matches.count)"
+                )
             }
 
             switch matches.count {
@@ -195,7 +222,7 @@ public final class PeekModel: ObservableObject {
         let now = Date()
         let messages = [
             LarkMessage(id: "om_preview_1", chatID: chat.id, createTime: now.addingTimeInterval(-320), sender: MessageSender(name: "林澈"), content: "<p>新的 **Markdown** 预览已经可以体验了。</p><p>- 无序列表\n  - 嵌套列表\n> 引用内容</p>"),
-            LarkMessage(id: "om_preview_2", chatID: chat.id, type: "interactive", createTime: now.addingTimeInterval(-180), sender: MessageSender(name: "周然"), content: "**体验提醒**\n鼠标停在飞书会话上，按 ⌃⌥P 查看最近消息。"),
+            LarkMessage(id: "om_preview_2", chatID: chat.id, type: "interactive", createTime: now.addingTimeInterval(-180), sender: MessageSender(name: "周然"), content: "**体验提醒**\n鼠标停在飞书会话上，长按 ⌥，或按 ⌃⌥P 查看最近消息。"),
             LarkMessage(id: "om_preview_3", chatID: chat.id, type: "share_chat", createTime: now.addingTimeInterval(-45), sender: MessageSender(name: "Lark Peek"), content: "分享了一个群聊", sharedChatID: "oc_preview_shared", sharedChatName: "产品设计交流群")
         ]
         state = .messages(conversation, chat, messages, now)
@@ -258,7 +285,7 @@ public final class PeekModel: ObservableObject {
         nextPageToken = page.nextPageToken
     }
 
-    private func findByPagingRecentChats(name: String, using client: LarkCLIClient) async throws -> [LarkChat] {
+    private func findExactByPagingRecentChats(name: String, using client: LarkCLIClient) async throws -> [LarkChat] {
         var token = nextPageToken
         for _ in 0..<4 {
             try Task.checkCancellation()
@@ -267,7 +294,7 @@ public final class PeekModel: ObservableObject {
             let page = try LarkCLIParser.chatPage(from: result.data)
             mergeChats(page.chats)
             nextPageToken = page.nextPageToken
-            let matches = ChatMatcher.matches(name: name, in: page.chats)
+            let matches = ChatMatcher.exactMatches(name: name, in: page.chats)
             if !matches.isEmpty { return matches }
             token = page.nextPageToken
         }

@@ -52,7 +52,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
     private func installStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = NSImage(systemSymbolName: "eye.circle.fill", accessibilityDescription: "Lark Peek")
-        item.button?.toolTip = "Lark Peek · 悬停飞书会话后按住 ⌥"
+        item.button?.toolTip = "Lark Peek · 悬停会话后长按 ⌥，或按 ⌃⌥P"
         statusItem = item
         rebuildMenu()
     }
@@ -62,11 +62,10 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         let status = NSMenuItem(title: model.statusMessage, action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
-        let guide = NSMenuItem(title: "悬停飞书会话，然后按住 ⌥", action: nil, keyEquivalent: "")
+        let guide = NSMenuItem(title: "悬停会话后：长按 ⌥，或按 ⌃⌥P", action: nil, keyEquivalent: "")
         guide.isEnabled = false
         menu.addItem(guide)
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "现在预览鼠标下的会话", action: #selector(peekFromMenu), keyEquivalent: "p"))
         menu.addItem(NSMenuItem(title: "检查辅助功能权限…", action: #selector(requestAccessibility), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "选择 lark-cli…", action: #selector(selectCLI), keyEquivalent: ""))
         menu.addItem(.separator())
@@ -155,7 +154,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
             _ = hoverResolver.requestAccessibilityPermission()
             panelController.showError(
                 "需要辅助功能权限",
-                detail: "授权后不需要重启飞书。把鼠标停在会话行上，再按住 ⌥。",
+                detail: "授权后不需要重启飞书。把鼠标停在会话行上，长按 ⌥，或按 ⌃⌥P。",
                 anchor: cursorAnchor()
             )
         } catch {
@@ -175,10 +174,6 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
     private func closeIfClickIsOutside() {
         guard panelController.isVisible else { return }
         if !panelController.frame.contains(NSEvent.mouseLocation) { closePeek() }
-    }
-
-    @objc private func peekFromMenu() {
-        DispatchQueue.main.async { [weak self] in self?.activatePeek() }
     }
 
     @objc private func requestAccessibility() {

@@ -186,14 +186,24 @@ public enum ConversationText {
 }
 
 public enum ChatMatcher {
-    public static func matches(name: String, in chats: [LarkChat]) -> [LarkChat] {
+    public static func exactMatches(name: String, in chats: [LarkChat]) -> [LarkChat] {
         let target = ConversationText.normalize(name)
         guard !target.isEmpty else { return [] }
-        let exact = chats.filter { ConversationText.normalize($0.name) == target }
-        if !exact.isEmpty { return exact }
+        return chats.filter { ConversationText.normalize($0.name) == target }
+    }
+
+    public static func fuzzyMatches(name: String, in chats: [LarkChat]) -> [LarkChat] {
+        let target = ConversationText.normalize(name)
+        guard !target.isEmpty else { return [] }
         return chats.filter {
             let candidate = ConversationText.normalize($0.name)
-            return candidate.hasPrefix(target) || target.hasPrefix(candidate)
+            return candidate != target
+                && (candidate.hasPrefix(target) || target.hasPrefix(candidate))
         }
+    }
+
+    public static func matches(name: String, in chats: [LarkChat]) -> [LarkChat] {
+        let exact = exactMatches(name: name, in: chats)
+        return exact.isEmpty ? fuzzyMatches(name: name, in: chats) : exact
     }
 }

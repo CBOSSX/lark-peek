@@ -124,6 +124,15 @@ import Testing
     #expect(ChatMatcher.matches(name: "产品群", in: chats).count == 2)
 }
 
+@Test func chatMatcherDoesNotLetAnEarlierFuzzyGroupHideALaterExactP2P() {
+    let fuzzyGroup = LarkChat(id: "oc_group", name: "白卿, 曹博淳, 高俊辉", kind: .group)
+    let exactP2P = LarkChat(id: "oc_p2p", name: "白卿", kind: .p2p)
+
+    #expect(ChatMatcher.exactMatches(name: "白卿", in: [fuzzyGroup]).isEmpty)
+    #expect(ChatMatcher.fuzzyMatches(name: "白卿", in: [fuzzyGroup]).map(\.id) == ["oc_group"])
+    #expect(ChatMatcher.matches(name: "白卿", in: [fuzzyGroup, exactP2P]).map(\.id) == ["oc_p2p"])
+}
+
 @Test func conversationNameHeuristicSkipsUnreadCountsBadgesAndTimes() {
     let texts = ["432", "公开", "14:20", "Botmux 交流群", "刘兆庆", ":", "最新消息"]
     #expect(ConversationNameHeuristics.chooseName(fromOrderedTexts: texts) == "Botmux 交流群")
