@@ -41,10 +41,15 @@ if ! security find-identity -v -p codesigning 2>/dev/null \
   echo "Run: $project_dir/Scripts/setup-local-signing.sh" >&2
   exit 1
 fi
-codesign \
-  --force \
-  --options runtime \
-  --timestamp=none \
-  --sign "$signing_identity" \
-  "$app_path"
+codesign_args=(
+  --force
+  --options runtime
+  --sign "$signing_identity"
+)
+if [[ "$signing_identity" == "Developer ID Application:"* ]]; then
+  codesign_args+=(--timestamp)
+else
+  codesign_args+=(--timestamp=none)
+fi
+codesign "${codesign_args[@]}" "$app_path"
 echo "$app_path"

@@ -68,6 +68,25 @@ codesign --verify --deep --strict "dist/Lark Peek.app"
 LARK_PEEK_CODESIGN_IDENTITY="Apple Development: Your Name (...)" ./Scripts/build-app.sh
 ```
 
+### 发布签名与公证
+
+向普通用户分发 App 时，需要加入 Apple Developer Program，并在钥匙串中安装 `Developer ID Application` 证书。然后将公证凭证安全地保存到钥匙串；下面的命令会交互式询问 app-specific password，不要把密码直接写进命令或仓库：
+
+```bash
+xcrun notarytool store-credentials LarkPeekNotary \
+  --apple-id "your-apple-id@example.com" \
+  --team-id "YOURTEAMID"
+```
+
+完成一次性配置后，运行：
+
+```bash
+LARK_PEEK_CODESIGN_IDENTITY="Developer ID Application: Your Name (YOURTEAMID)" \
+  ./Scripts/notarize-app.sh
+```
+
+脚本会使用 hardened runtime 和安全时间戳签名，提交 Apple 公证，将 ticket staple 到 App，执行 Gatekeeper 验证，并生成可分发的 `dist/Lark-Peek.zip`。
+
 无飞书请求的视觉预览：
 
 ```bash
