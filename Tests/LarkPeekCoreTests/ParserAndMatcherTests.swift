@@ -435,7 +435,12 @@ import Testing
         return
     }
     #expect(chat.name == "产品体验群")
-    #expect(messages.count == 5)
+    #expect(messages.count == 6)
     #expect(messages[2].forwardedMessages.count == 3)
     #expect(messages[3].threadReplies.count == 2)
+    let imageMessage = try #require(messages.last)
+    #expect(imageMessage.id == "om_preview_image")
+    #expect(imageMessage.images.first?.key == "img_preview_fixture")
+    #expect(imageMessage.images.first?.data?.isEmpty == false)
+    #expect(imageMessage.images.first?.attempted == true)
 }
