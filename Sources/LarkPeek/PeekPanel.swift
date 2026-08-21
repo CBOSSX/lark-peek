@@ -349,8 +349,8 @@ private struct PeekPanelView: View {
             loadingView(conversation)
         case let .candidates(conversation, chats):
             candidateView(conversation, chats: chats)
-        case let .messages(_, _, messages, revision):
-            MessageTimelineView(model: model, messages: messages, revision: revision)
+        case let .messages(_, _, messages, _):
+            MessageTimelineView(model: model, messages: messages)
         case let .error(_, message):
             errorView(message)
         }
@@ -450,7 +450,6 @@ private struct PeekPanelView: View {
 private struct MessageTimelineView: View {
     @ObservedObject var model: PeekModel
     let messages: [LarkMessage]
-    let revision: Date
 
     @State private var initializedChatID: String?
     @State private var loadTask: Task<Void, Never>?
@@ -459,90 +458,57 @@ private struct MessageTimelineView: View {
     private var chatID: String? { messages.first?.chatID }
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
-                    if model.hasOlderMessages {
-                        olderMessagesTrigger
-                    }
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        if messages.isEmpty {
-                            ContentUnavailableView("没有可显示的消息", systemImage: "bubble.left")
-                                .frame(maxWidth: .infinity)
-                                .padding(.top, 110)
-                        }
-                        ForEach(messages) { message in
-                            messageRow(message)
-                                // Keep the visual bottom inset inside the final
-                                // scroll target. An outer VStack padding is not
-                                // included when scrollTo aligns the row's ID.
-                                .padding(.bottom, message.id == messages.last?.id ? 8 : 0)
-                                .id(message.id)
-                        }
-                    }
-                    .scrollTargetLayout()
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                if model.hasOlderMessages {
+                    olderMessagesTrigger
                 }
-                .padding(.horizontal, 14)
-                .background {
-                    ScrollTopObserver {
-                        guard initializedChatID == chatID else { return }
-                        timelineLogger.debug(
-                            "Reached timeline top chat=\(chatID ?? "none", privacy: .private(mask: .hash)) count=\(messages.count)"
-                        )
-                        loadOlderMessages()
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    if messages.isEmpty {
+                        ContentUnavailableView("没有可显示的消息", systemImage: "bubble.left")
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 110)
+                    }
+                    ForEach(messages) { message in
+                        messageRow(message)
+                            .padding(.bottom, message.id == messages.last?.id ? 8 : 0)
+                            .id(message.id)
                     }
                 }
+                .scrollTargetLayout()
             }
-            .scrollPosition(id: $scrollPositionID, anchor: .top)
-            .task(id: revision) {
-                if initializedChatID != chatID {
-                    initializedChatID = nil
-                }
-                // Initial message loading publishes multiple revisions while
-                // sender names and images are resolved. Align every one of those
-                // revisions to the bottom, but never disturb the preserved
-                // position while an older page is being prepended.
-                guard loadTask == nil, !model.isLoadingOlderMessages else { return }
-                guard let lastMessageID = messages.last?.id else {
-                    timelineLogger.info(
-                        "Timeline has no messages to align chat=\(chatID ?? "none", privacy: .private(mask: .hash))"
-                    )
-                    return
-                }
-                timelineLogger.info(
-                    "Aligning timeline to newest message chat=\(chatID ?? "none", privacy: .private(mask: .hash)) last=\(lastMessageID, privacy: .private(mask: .hash)) count=\(messages.count)"
-                )
-                do {
-                    try await Task.sleep(for: .milliseconds(40))
-                } catch {
-                    timelineLogger.info(
-                        "Timeline alignment superseded by a newer revision chat=\(chatID ?? "none", privacy: .private(mask: .hash))"
-                    )
-                    return
-                }
-                proxy.scrollTo(lastMessageID, anchor: .bottom)
-                do {
-                    try await Task.sleep(for: .milliseconds(40))
-                } catch {
-                    timelineLogger.info(
-                        "Timeline alignment completion superseded chat=\(chatID ?? "none", privacy: .private(mask: .hash))"
-                    )
-                    return
-                }
-                initializedChatID = chatID
-                timelineLogger.info(
-                    "Timeline aligned to newest message chat=\(chatID ?? "none", privacy: .private(mask: .hash)) last=\(lastMessageID, privacy: .private(mask: .hash)) count=\(messages.count)"
-                )
-            }
-            .onDisappear {
-                if loadTask != nil {
+            .padding(.horizontal, 14)
+            .background {
+                ScrollTopObserver {
+                    guard initializedChatID == chatID else { return }
                     timelineLogger.debug(
-                        "Cancelling older-message UI task chat=\(chatID ?? "none", privacy: .private(mask: .hash))"
+                        "Reached timeline top chat=\(chatID ?? "none", privacy: .private(mask: .hash)) count=\(messages.count)"
                     )
+                    loadOlderMessages()
                 }
-                loadTask?.cancel()
-                loadTask = nil
             }
+        }
+        // Establish the initial viewport during SwiftUI's first layout pass,
+        // instead of rendering at the top and scrolling down a frame later.
+        .defaultScrollAnchor(.bottom)
+        .scrollPosition(id: $scrollPositionID, anchor: .top)
+        .task(id: chatID) {
+            initializedChatID = nil
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            initializedChatID = chatID
+            timelineLogger.info(
+                "Timeline initialized with bottom anchor chat=\(chatID ?? "none", privacy: .private(mask: .hash)) count=\(messages.count)"
+            )
+        }
+        .onDisappear {
+            if loadTask != nil {
+                timelineLogger.debug(
+                    "Cancelling older-message UI task chat=\(chatID ?? "none", privacy: .private(mask: .hash))"
+                )
+            }
+            loadTask?.cancel()
+            loadTask = nil
         }
     }
 
