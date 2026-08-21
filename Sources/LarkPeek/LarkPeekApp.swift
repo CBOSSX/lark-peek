@@ -107,7 +107,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         guard event.keyCode == 35, flags.contains([.control, .option]) else { return }
-        activatePeek()
+        activatePeek(showResolutionErrors: true)
     }
 
     private func handleModifierFlags(_ event: NSEvent) {
@@ -128,7 +128,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
                 guard !Task.isCancelled, let self, self.isOptionHeld else { return }
                 self.optionHoldTask = nil
                 self.isOptionPeekActive = true
-                self.activatePeek()
+                self.activatePeek(showResolutionErrors: false)
             }
             return
         }
@@ -142,7 +142,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func activatePeek() {
+    private func activatePeek(showResolutionErrors: Bool) {
         do {
             let conversation = try hoverResolver.resolveCurrentConversation()
             peekTask?.cancel()
@@ -151,6 +151,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
                 await self?.model.peek(conversation)
             }
         } catch HoverResolverError.accessibilityPermissionMissing {
+            guard showResolutionErrors else { return }
             _ = hoverResolver.requestAccessibilityPermission()
             panelController.showError(
                 "需要辅助功能权限",
@@ -158,6 +159,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
                 anchor: cursorAnchor()
             )
         } catch {
+            guard showResolutionErrors else { return }
             panelController.showError("无法识别会话", detail: error.localizedDescription, anchor: cursorAnchor())
         }
     }
