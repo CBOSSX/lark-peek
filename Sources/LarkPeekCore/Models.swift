@@ -195,6 +195,193 @@ public struct HoveredConversation: Equatable, Sendable {
     public var fingerprint: String {
         ConversationText.normalize([name] + rowTexts.prefix(5))
     }
+
+    public var threadHint: ThreadRowHint? {
+        ThreadRowHeuristics.hint(from: rowTexts.isEmpty ? [name] : rowTexts)
+    }
+}
+
+public struct ThreadRowHint: Equatable, Sendable {
+    public let rootSender: String
+    public let rootExcerpt: String
+    public let latestReplySender: String?
+    public let latestReplyExcerpt: String
+    public let searchQuery: String
+    public let replySearchQuery: String?
+    public let activityMarker: String
+
+    public init(
+        rootSender: String,
+        rootExcerpt: String,
+        latestReplySender: String?,
+        latestReplyExcerpt: String,
+        searchQuery: String,
+        replySearchQuery: String?,
+        activityMarker: String
+    ) {
+        self.rootSender = rootSender
+        self.rootExcerpt = rootExcerpt
+        self.latestReplySender = latestReplySender
+        self.latestReplyExcerpt = latestReplyExcerpt
+        self.searchQuery = searchQuery
+        self.replySearchQuery = replySearchQuery
+        self.activityMarker = activityMarker
+    }
+
+    public var stableFingerprint: String {
+        ConversationText.normalize([rootSender, rootExcerpt])
+    }
+}
+
+public enum ThreadRowHeuristics {
+    // In Feishu's mixed "Messages" list, a standalone thread is exposed as one
+    // flattened accessibility text node:
+    //   root sender: root content 14:12 latest sender: latest reply
+    // or, for compact rows:
+    //   root sender: root content 11:49 latest reply
+    // This is only a routing hint. A server result with a real thread_id is
+    // still required before the row is treated as a thread.
+    private static let rootSenderPattern = try! NSRegularExpression(
+        pattern: #"^\s*([^:：\n]{1,40})\s*[:：]\s*"#
+    )
+    private static let replyTimePattern = try! NSRegularExpression(
+        pattern: #"\s+(\d{1,2}:\d{2}|昨天|前天|\d{1,2}月\d{1,2}日)\s+"#
+    )
+    private static let replySenderPattern = try! NSRegularExpression(
+        pattern: #"^\s*([^:：\n]{1,40}?)\s*[:：](?!\d)\s*"#
+    )
+
+    public static func hint(from texts: [String]) -> ThreadRowHint? {
+        // Accessibility exposes the same Feishu row differently across builds:
+        // sometimes as one flattened static text, sometimes as separate title,
+        // time, sender and reply nodes. Try each node first, then suffix joins
+        // so leading unread badges do not prevent the title node from becoming
+        // the start of the candidate.
+        let trimmedTexts = texts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        var candidates: [String] = []
+        if trimmedTexts.count > 1 {
+            for start in trimmedTexts.indices
+                where start < trimmedTexts.index(before: trimmedTexts.endIndex)
+                    && (trimmedTexts[start].contains(":") || trimmedTexts[start].contains("：")) {
+                candidates.append(trimmedTexts[start...].joined(separator: " "))
+            }
+        }
+        candidates.append(contentsOf: trimmedTexts)
+
+        for rawText in candidates {
+            let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            guard let senderMatch = rootSenderPattern.firstMatch(in: text, range: range),
+                  let rootSender = capture(1, match: senderMatch, in: text),
+                  let contentStart = Range(senderMatch.range, in: text)?.upperBound
+            else { continue }
+
+            let remainderRange = NSRange(contentStart..<text.endIndex, in: text)
+            guard let timeMatch = replyTimePattern.matches(in: text, range: remainderRange).last,
+                  let markerRange = Range(timeMatch.range, in: text),
+                  let activityMarker = capture(1, match: timeMatch, in: text)
+            else { continue }
+
+            let rootExcerpt = String(text[contentStart..<markerRange.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let replyTail = String(text[markerRange.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let replyTailRange = NSRange(replyTail.startIndex..<replyTail.endIndex, in: replyTail)
+            let replySenderMatch = replySenderPattern.firstMatch(in: replyTail, range: replyTailRange)
+            let latestReplySender = replySenderMatch.flatMap { capture(1, match: $0, in: replyTail) }
+            let latestReplyExcerpt: String
+            if let replySenderMatch,
+               let replyStart = Range(replySenderMatch.range, in: replyTail)?.upperBound {
+                latestReplyExcerpt = String(replyTail[replyStart...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                latestReplyExcerpt = replyTail
+            }
+            guard !rootExcerpt.isEmpty, !latestReplyExcerpt.isEmpty,
+                  let query = searchQuery(from: rootExcerpt)
+            else { continue }
+
+            return ThreadRowHint(
+                rootSender: rootSender,
+                rootExcerpt: rootExcerpt,
+                latestReplySender: latestReplySender,
+                latestReplyExcerpt: latestReplyExcerpt,
+                searchQuery: query,
+                replySearchQuery: searchQuery(from: latestReplyExcerpt),
+                activityMarker: activityMarker
+            )
+        }
+        return nil
+    }
+
+    private static func capture(_ index: Int, match: NSTextCheckingResult, in text: String) -> String? {
+        guard let range = Range(match.range(at: index), in: text) else { return nil }
+        let value = String(text[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private static func searchQuery(from excerpt: String) -> String? {
+        var value = excerpt
+        if value.trimmingCharacters(in: .whitespacesAndNewlines) == "[会话记录]" {
+            return "[会话记录]"
+        }
+        // Link display titles can be longer than the actual topic sentence and
+        // may not be present in message-search's normalized content. Prefer the
+        // authored text before the first rich-link placeholder.
+        if let linkRange = value.range(of: "[链接]") {
+            value = String(value[..<linkRange.lowerBound])
+        }
+        value = value.replacingOccurrences(of: #"@[^ \t\r\n@]+"#, with: " ", options: .regularExpression)
+        value = value.replacingOccurrences(of: #"https?://\S+"#, with: " ", options: .regularExpression)
+        value = value.replacingOccurrences(of: #"\[[^\]]+\]"#, with: " ", options: .regularExpression)
+        value = value.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let clauses = value.components(separatedBy: CharacterSet(charactersIn: "，。！？；;、&＆\n"))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let withoutClock = clauses.filter {
+            $0.range(of: #"\d{1,2}:\d{2}"#, options: .regularExpression) == nil
+        }
+        let candidates = withoutClock.isEmpty ? clauses : withoutClock
+        let candidate = candidates.max { lhs, rhs in lhs.count < rhs.count } ?? value
+        guard !candidate.isEmpty else { return nil }
+        return String(candidate.prefix(32))
+    }
+}
+
+public struct ThreadSearchHit: Equatable, Sendable {
+    public let rootMessage: LarkMessage
+    public let chat: LarkChat
+
+    public init(rootMessage: LarkMessage, chat: LarkChat) {
+        self.rootMessage = rootMessage
+        self.chat = chat
+    }
+}
+
+public enum ThreadSearchMatcher {
+    public static func bestHit(for hint: ThreadRowHint, in hits: [ThreadSearchHit]) -> ThreadSearchHit? {
+        let scored = hits.compactMap { hit -> (ThreadSearchHit, Int)? in
+            guard hit.rootMessage.threadID != nil else { return nil }
+            let content = ConversationText.normalize(hit.rootMessage.content)
+            let query = ConversationText.normalize(hint.searchQuery)
+            let excerpt = ConversationText.normalize(hint.rootExcerpt)
+            let senderMatches = ConversationText.normalize(hit.rootMessage.sender.name)
+                == ConversationText.normalize(hint.rootSender)
+            var score = 0
+            if !query.isEmpty, content.contains(query) { score += 4 }
+            if !excerpt.isEmpty, excerpt.contains(content) || content.contains(excerpt) { score += 2 }
+            if senderMatches { score += 2 }
+            guard score >= 6 else { return nil }
+            return (hit, score)
+        }
+        guard let highest = scored.map(\.1).max() else { return nil }
+        let winners = scored.filter { $0.1 == highest }
+        return winners.count == 1 ? winners[0].0 : nil
+    }
 }
 
 public enum ConversationText {

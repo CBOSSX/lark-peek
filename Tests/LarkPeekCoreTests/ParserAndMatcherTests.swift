@@ -89,6 +89,17 @@ import Testing
     #expect(replies.nextPageToken == nil)
 }
 
+@Test func parsesThreadSearchHitsWithChatContext() throws {
+    let json = #"{"ok":true,"data":{"messages":[{"message_id":"om_root","chat_id":"oc_group","chat_name":"业务侧需求沟通","chat_type":"group","msg_type":"text","thread_id":"omt_topic","sender":{"name":"曹沙沙"},"content":"辛苦大家更新下各业务线开发进展"}]}}"#
+
+    let hits = try LarkCLIParser.threadSearchHits(from: Data(json.utf8))
+
+    #expect(hits.count == 1)
+    #expect(hits[0].rootMessage.threadID == "omt_topic")
+    #expect(hits[0].chat.id == "oc_group")
+    #expect(hits[0].chat.name == "业务侧需求沟通")
+}
+
 @Test func removesCardMarkupAndMentionIDs() throws {
     let json = #"{"ok":true,"data":{"messages":[{"message_id":"om_xml_card","msg_type":"interactive","content":"<card title=\"文档内容变更提醒\">\n@王淼 (ou_572cbf21d8d54a4bc69de598df27f44e) 编辑了文档 [来啦！](https://example.com)\n[查看变更详情](https://example.com/detail) [取消关注]\n</card>"}]}}"#
     let message = try #require(LarkCLIParser.messages(from: Data(json.utf8), fallbackChatID: "oc_1").first)
@@ -169,6 +180,141 @@ import Testing
 @Test func conversationNameHeuristicSkipsUnreadCountsBadgesAndTimes() {
     let texts = ["432", "公开", "14:20", "Botmux 交流群", "刘兆庆", ":", "最新消息"]
     #expect(ConversationNameHeuristics.chooseName(fromOrderedTexts: texts) == "Botmux 交流群")
+}
+
+@Test func standaloneThreadRowProducesStableRootHintWhenLatestReplyChanges() throws {
+    let root = "曹沙沙: @王志鹏 @夏元瑞 辛苦大家 3:30 日会前，更新下各业务线开发进展、风险、问题[比心]-[链接]双日会"
+    let first = HoveredConversation(
+        name: root,
+        rowFrame: .zero,
+        rowTexts: ["2", root + " 14:12 田阁良 : CC @韦理静 换成你了哈"]
+    )
+    let second = HoveredConversation(
+        name: root,
+        rowFrame: .zero,
+        rowTexts: ["5", root + " 15:30 夏元瑞: 今天的风险已经更新"]
+    )
+
+    let firstHint = try #require(first.threadHint)
+    let secondHint = try #require(second.threadHint)
+    #expect(firstHint.rootSender == "曹沙沙")
+    #expect(firstHint.latestReplySender == "田阁良")
+    #expect(firstHint.searchQuery == "更新下各业务线开发进展")
+    #expect(firstHint.stableFingerprint == secondHint.stableFingerprint)
+    #expect(first.fingerprint != second.fingerprint)
+}
+
+@Test func compactStandaloneThreadWithoutReplySenderIsRecognized() throws {
+    let conversation = HoveredConversation(
+        name: "曹博淳: 测试一下话题。",
+        rowFrame: .zero,
+        rowTexts: ["曹博淳: 测试一下话题。 11:49 对的对的"]
+    )
+
+    let hint = try #require(conversation.threadHint)
+    #expect(hint.rootSender == "曹博淳")
+    #expect(hint.rootExcerpt == "测试一下话题。")
+    #expect(hint.latestReplySender == nil)
+    #expect(hint.latestReplyExcerpt == "对的对的")
+    #expect(hint.searchQuery == "测试一下话题")
+}
+
+@Test func splitAccessibilityNodesForStandaloneThreadsAreRecognized() throws {
+    let compact = HoveredConversation(
+        name: "曹博淳: 测试一下话题。",
+        rowFrame: .zero,
+        rowTexts: ["曹博淳: 测试一下话题。", "11:49", "对的对的"]
+    )
+    let long = HoveredConversation(
+        name: "曹沙沙: @王志鹏 辛苦大家 3:30 日会前，更新下各业务线开发进展、风险、问题",
+        rowFrame: .zero,
+        rowTexts: [
+            "2",
+            "曹沙沙: @王志鹏 辛苦大家 3:30 日会前，更新下各业务线开发进展、风险、问题",
+            "14:12",
+            "田阁良 :",
+            "CC @韦理静 换成你了哈"
+        ]
+    )
+
+    let compactHint = try #require(compact.threadHint)
+    let longHint = try #require(long.threadHint)
+    #expect(compactHint.rootSender == "曹博淳")
+    #expect(compactHint.latestReplySender == nil)
+    #expect(compactHint.latestReplyExcerpt == "对的对的")
+    #expect(longHint.rootSender == "曹沙沙")
+    #expect(longHint.latestReplySender == "田阁良")
+    #expect(longHint.searchQuery == "更新下各业务线开发进展")
+}
+
+@Test func standaloneThreadQueryIgnoresLongRichLinkTitle() throws {
+    let text = "曹沙沙: @王志鹏 @夏元瑞 辛苦大家 3:30 日会前，更新下各业务线开发进展、风险、问题[比心][比心]-[链接]豆包团队订阅 & 企业订阅 跨业务线双日会 14:12 田阁良 : CC @韦理静 换成你了哈"
+
+    let hint = try #require(ThreadRowHeuristics.hint(from: [text]))
+
+    #expect(hint.searchQuery == "更新下各业务线开发进展")
+}
+
+@Test func veryShortAndMergedForwardTopicRowsStillProduceFallbackHints() throws {
+    let short = try #require(ThreadRowHeuristics.hint(from: [
+        "曹博淳: 6", "8月17日", "超过 30 天没来看看了，助理休眠啦，正在唤醒中……预计 1-2 分钟整装完毕满血复活，请稍候"
+    ]))
+    let mergedForward = try #require(ThreadRowHeuristics.hint(from: [
+        "管娟娟: [会话记录]", "7月15日", "曹博淳", ":", "@沈泽楠 还有个想请教下的，就是这个需求之前，豆包文档会打开调get_summary_cache这个接口吗？"
+    ]))
+
+    #expect(short.searchQuery == "6")
+    #expect(short.activityMarker == "8月17日")
+    #expect((short.replySearchQuery?.count ?? 0) >= 6)
+    #expect(mergedForward.searchQuery == "[会话记录]")
+    #expect(mergedForward.latestReplySender == "曹博淳")
+    #expect(mergedForward.replySearchQuery != nil)
+}
+
+@Test func ordinaryChatRowsAreNotClassifiedAsStandaloneThreads() {
+    let group = HoveredConversation(
+        name: "Aime 内测交流6群",
+        rowFrame: .zero,
+        rowTexts: ["272", "Aime 内测交流6群", "公开", "14:07 王欣 : 陈依扬的话题"]
+    )
+    let flattenedGroup = HoveredConversation(
+        name: "CM 查日志专用群",
+        rowFrame: .zero,
+        rowTexts: ["173", "CM 查日志专用群 14:26 QEE Oncall 助手 : 请选择业务线请选择查询时间"]
+    )
+
+    #expect(group.threadHint == nil)
+    #expect(flattenedGroup.threadHint == nil)
+}
+
+@Test func threadSearchMatcherRequiresOneHighConfidenceThread() throws {
+    let hint = try #require(ThreadRowHeuristics.hint(from: [
+        "曹沙沙: 辛苦大家更新下各业务线开发进展 14:12 田阁良: 已更新"
+    ]))
+    let matching = ThreadSearchHit(
+        rootMessage: LarkMessage(
+            id: "om_root",
+            chatID: "oc_group",
+            createTime: .now,
+            sender: MessageSender(name: "曹沙沙"),
+            content: "辛苦大家更新下各业务线开发进展",
+            threadID: "omt_topic"
+        ),
+        chat: LarkChat(id: "oc_group", name: "业务群", kind: .group)
+    )
+    let noThread = ThreadSearchHit(
+        rootMessage: LarkMessage(
+            id: "om_plain",
+            chatID: "oc_group",
+            createTime: .now,
+            sender: MessageSender(name: "曹沙沙"),
+            content: "辛苦大家更新下各业务线开发进展"
+        ),
+        chat: matching.chat
+    )
+
+    #expect(ThreadSearchMatcher.bestHit(for: hint, in: [noThread, matching])?.rootMessage.id == "om_root")
+    #expect(ThreadSearchMatcher.bestHit(for: hint, in: [matching, matching]) == nil)
 }
 
 @Test func larkApplicationIdentityAcceptsElectronHelperProcesses() {

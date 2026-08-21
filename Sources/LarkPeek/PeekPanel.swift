@@ -349,8 +349,12 @@ private struct PeekPanelView: View {
             loadingView(conversation)
         case let .candidates(conversation, chats):
             candidateView(conversation, chats: chats)
-        case let .messages(_, _, messages, _):
-            MessageTimelineView(model: model, messages: messages)
+        case let .messages(conversation, _, messages, _):
+            MessageTimelineView(
+                model: model,
+                messages: messages,
+                expandThreadsByDefault: conversation.threadHint != nil
+            )
         case let .error(_, message):
             errorView(message)
         }
@@ -450,6 +454,7 @@ private struct PeekPanelView: View {
 private struct MessageTimelineView: View {
     @ObservedObject var model: PeekModel
     let messages: [LarkMessage]
+    let expandThreadsByDefault: Bool
 
     @State private var initializedChatID: String?
     @State private var loadTask: Task<Void, Never>?
@@ -604,7 +609,10 @@ private struct MessageTimelineView: View {
                     }
                     Spacer()
                 }
-                MessageContentView(message: message)
+                MessageContentView(
+                    message: message,
+                    expandThreadByDefault: expandThreadsByDefault
+                )
             }
         }
         .padding(11)
@@ -626,12 +634,16 @@ private struct MessageTimelineView: View {
 
 private struct MessageContentView: View {
     let message: LarkMessage
+    let expandThreadByDefault: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             MessageBodyView(message: message)
             if message.threadID != nil {
-                TopicRepliesCard(message: message)
+                TopicRepliesCard(
+                    message: message,
+                    initiallyExpanded: expandThreadByDefault
+                )
             }
         }
         .fixedSize(horizontal: false, vertical: true)
@@ -814,7 +826,12 @@ private struct ForwardedMessagesCard: View {
 
 private struct TopicRepliesCard: View {
     let message: LarkMessage
-    @State private var isExpanded = false
+    @State private var isExpanded: Bool
+
+    init(message: LarkMessage, initiallyExpanded: Bool = false) {
+        self.message = message
+        _isExpanded = State(initialValue: initiallyExpanded)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {

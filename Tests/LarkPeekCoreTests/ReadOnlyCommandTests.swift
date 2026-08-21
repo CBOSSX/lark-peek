@@ -9,6 +9,9 @@ import Testing
     #expect(try ReadOnlyCommand.searchChats(query: "产品群").arguments() == [
         "im", "+chat-search", "--as", "user", "--query", "产品群", "--search-types", "private,public_joined,external", "--page-size", "20", "--format", "json"
     ])
+    #expect(try ReadOnlyCommand.searchMessages(query: "更新下各业务线开发进展").arguments() == [
+        "im", "+messages-search", "--as", "user", "--query", "更新下各业务线开发进展", "--page-size", "10", "--no-reactions", "--format", "json"
+    ])
     #expect(try ReadOnlyCommand.chatDetails(chatID: "oc_safe").arguments() == [
         "im", "chats", "get", "--as", "user", "--chat-id", "oc_safe", "--format", "json"
     ])
@@ -38,10 +41,31 @@ import Testing
     #expect(throws: (any Error).self) { try ReadOnlyCommand.recentChats(pageToken: "next\n--yes").arguments() }
     #expect(throws: (any Error).self) { try ReadOnlyCommand.searchChats(query: "").arguments() }
     #expect(throws: (any Error).self) { try ReadOnlyCommand.searchChats(query: String(repeating: "x", count: 65)).arguments() }
+    #expect(throws: (any Error).self) { try ReadOnlyCommand.searchMessages(query: "").arguments() }
+    #expect(throws: (any Error).self) { try ReadOnlyCommand.searchMessages(query: "安全查询\n--yes").arguments() }
+    #expect(throws: (any Error).self) {
+        try ReadOnlyCommand.searchMessages(query: "6", start: "2026-08-17 --yes").arguments()
+    }
     #expect(throws: (any Error).self) { try ReadOnlyCommand.threadMessages(threadID: "omt_safe\n--yes").arguments() }
     #expect(throws: (any Error).self) {
         try ReadOnlyCommand.messageImage(messageID: "om_safe", fileKey: "img_safe", outputPath: "../escape").arguments()
     }
+}
+
+@Test func shortThreadSearchCanBeNarrowedByChatAndDate() throws {
+    #expect(try ReadOnlyCommand.searchMessages(
+        query: "6",
+        chatIDs: ["oc_one", "oc_two"],
+        start: "2026-08-17T00:00:00+08:00",
+        end: "2026-08-18T00:00:00+08:00",
+        pageSize: 50
+    ).arguments() == [
+        "im", "+messages-search", "--as", "user", "--query", "6",
+        "--chat-id", "oc_one,oc_two",
+        "--start", "2026-08-17T00:00:00+08:00",
+        "--end", "2026-08-18T00:00:00+08:00",
+        "--page-size", "50", "--no-reactions", "--format", "json"
+    ])
 }
 
 @Test func allowedCommandsContainNoServerMutationOrGenericAPIEntrypoint() throws {
@@ -50,6 +74,7 @@ import Testing
         .recentChats(),
         .recentChats(pageToken: "next"),
         .searchChats(query: "产品群"),
+        .searchMessages(query: "更新下各业务线开发进展"),
         .chatDetails(chatID: "oc_safe"),
         .recentMessages(chatID: "oc_safe"),
         .recentMessages(chatID: "oc_safe", pageToken: "older-page"),

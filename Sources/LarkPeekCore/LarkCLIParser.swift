@@ -21,6 +21,16 @@ public enum LarkCLIParser {
         }
     }
 
+    public struct ThreadSearchPage: Sendable {
+        public let hits: [ThreadSearchHit]
+        public let nextPageToken: String?
+
+        public init(hits: [ThreadSearchHit], nextPageToken: String?) {
+            self.hits = hits
+            self.nextPageToken = nextPageToken
+        }
+    }
+
     public static func authStatus(from data: Data) throws -> AuthStatus {
         let root = try dictionary(from: data)
         let identities = root["identities"] as? [String: Any]
@@ -54,6 +64,41 @@ public enum LarkCLIParser {
 
     public static func chats(from data: Data) throws -> [LarkChat] {
         try chatPage(from: data).chats
+    }
+
+    public static func threadSearchHits(from data: Data) throws -> [ThreadSearchHit] {
+        let root = try payload(from: data)
+        return threadSearchHits(from: root)
+    }
+
+    public static func threadSearchPage(from data: Data) throws -> ThreadSearchPage {
+        let root = try payload(from: data)
+        let hasMore = root["has_more"] as? Bool ?? root["hasMore"] as? Bool
+        let token = (root["page_token"] as? String)
+            ?? (root["next_page_token"] as? String)
+            ?? (root["nextPageToken"] as? String)
+        return ThreadSearchPage(
+            hits: threadSearchHits(from: root),
+            nextPageToken: hasMore == false ? nil : token.flatMap { $0.isEmpty ? nil : $0 }
+        )
+    }
+
+    private static func threadSearchHits(from root: [String: Any]) -> [ThreadSearchHit] {
+        let rows = root["messages"] as? [[String: Any]] ?? []
+        return rows.compactMap { row in
+            guard let rawChatID = row["chat_id"] as? String,
+                  let chatID = validChatID(rawChatID),
+                  let message = parseMessage(row, fallbackChatID: chatID),
+                  message.threadID != nil else { return nil }
+            let name = (row["chat_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let chat = LarkChat(
+                id: chatID,
+                name: name?.isEmpty == false ? name! : "话题所在群聊",
+                kind: ChatKind(chatMode: row["chat_type"] as? String),
+                external: row["external"] as? Bool ?? false
+            )
+            return ThreadSearchHit(rootMessage: message, chat: chat)
+        }
     }
 
     public static func chatDetails(from data: Data, chatID: String) throws -> LarkChat {

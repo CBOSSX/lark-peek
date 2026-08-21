@@ -28,6 +28,14 @@ public enum ReadOnlyCommand: Equatable, Sendable {
     case authStatus
     case recentChats(pageToken: String? = nil, pageSize: Int = 100)
     case searchChats(query: String, pageSize: Int = 20)
+    case searchMessages(
+        query: String,
+        chatIDs: [String] = [],
+        pageToken: String? = nil,
+        start: String? = nil,
+        end: String? = nil,
+        pageSize: Int = 10
+    )
     case chatDetails(chatID: String)
     case recentMessages(chatID: String, pageToken: String? = nil, pageSize: Int = 20)
     case threadMessages(threadID: String, pageToken: String? = nil, pageSize: Int = 50)
@@ -64,6 +72,30 @@ public enum ReadOnlyCommand: Equatable, Sendable {
                 "--page-size", String(min(max(pageSize, 1), 100)),
                 "--format", "json"
             ]
+
+        case let .searchMessages(query, chatIDs, pageToken, start, end, pageSize):
+            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, trimmed.count <= 128,
+                  !trimmed.contains("\0"), !trimmed.contains("\n") else {
+                throw CommandPolicyError.invalidQuery
+            }
+            var arguments = [
+                "im", "+messages-search",
+                "--as", "user",
+                "--query", trimmed
+            ]
+            if !chatIDs.isEmpty {
+                for chatID in chatIDs { try validateChatID(chatID) }
+                arguments += ["--chat-id", chatIDs.joined(separator: ",")]
+            }
+            try appendDateFilter(start, flag: "--start", to: &arguments)
+            try appendDateFilter(end, flag: "--end", to: &arguments)
+            arguments += [
+                "--page-size", String(min(max(pageSize, 1), 50)),
+                "--no-reactions", "--format", "json"
+            ]
+            try appendPageToken(pageToken, to: &arguments)
+            return arguments
 
         case let .chatDetails(chatID):
             try validateChatID(chatID)
@@ -128,6 +160,15 @@ public enum ReadOnlyCommand: Equatable, Sendable {
             throw CommandPolicyError.invalidPageToken
         }
         arguments.append(contentsOf: ["--page-token", token])
+    }
+
+    private func appendDateFilter(_ value: String?, flag: String, to arguments: inout [String]) throws {
+        guard let value else { return }
+        guard value.range(
+            of: #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$"#,
+            options: .regularExpression
+        ) != nil else { throw CommandPolicyError.invalidQuery }
+        arguments += [flag, value]
     }
 
     private func validateChatID(_ value: String) throws {
