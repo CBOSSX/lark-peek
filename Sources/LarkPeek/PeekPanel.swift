@@ -661,12 +661,8 @@ private struct MessageBodyView: View {
                 sharedChatCard
             } else if message.type == "interactive" {
                 interactiveCard
-            } else if !displayContent.isEmpty {
-                MarkdownMessageView(content: displayContent)
-            }
-
-            ForEach(message.images, id: \.key) { image in
-                messageImage(image)
+            } else {
+                orderedContent
             }
         }
         .fixedSize(horizontal: false, vertical: true)
@@ -677,12 +673,12 @@ private struct MessageBodyView: View {
             Label("互动卡片", systemImage: "rectangle.on.rectangle.angled")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.blue)
-            if displayContent == "[互动卡片]" {
+            if contentParts.isEmpty || message.content == "[互动卡片]" {
                 Text("这张卡片暂时没有可提取的文本内容")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             } else {
-                MarkdownMessageView(content: displayContent)
+                orderedContent
             }
         }
         .padding(10)
@@ -714,11 +710,23 @@ private struct MessageBodyView: View {
         .background(Color.teal.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
     }
 
-    private var displayContent: String {
-        guard !message.images.isEmpty else { return message.content }
-        return message.content
-            .replacingOccurrences(of: "[图片]", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    private var contentParts: [MessageMarkdown.ContentPart] {
+        MessageMarkdown.contentParts(from: message.content, imageKeys: message.images.map(\.key))
+    }
+
+    private var orderedContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(contentParts.enumerated()), id: \.offset) { _, part in
+                switch part {
+                case let .text(content):
+                    MarkdownMessageView(content: content)
+                case let .image(key):
+                    if let image = message.images.first(where: { $0.key == key }) {
+                        messageImage(image)
+                    }
+                }
+            }
+        }
     }
 
     @ViewBuilder

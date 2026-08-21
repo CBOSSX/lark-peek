@@ -163,6 +163,13 @@ public enum LarkCLIParser {
         let rawContent = stringify(row["content"])
         let deleted = row["deleted"] as? Bool ?? false
         let parsedContent = readableContent(rawContent, type: type)
+        let content: String
+        if parsedContent.text == "[图片]", parsedContent.imageKeys.count == 1,
+           let key = parsedContent.imageKeys.first {
+            content = imageMarker(for: key)
+        } else {
+            content = parsedContent.text
+        }
         return LarkMessage(
             id: id,
             chatID: row["chat_id"] as? String ?? fallbackChatID,
@@ -170,7 +177,7 @@ public enum LarkCLIParser {
             createTime: parseDate(row["create_time"]),
             position: parseInt64(row["message_position"]),
             sender: sender,
-            content: deleted ? "这条消息已撤回" : parsedContent.text,
+            content: deleted ? "这条消息已撤回" : content,
             images: deleted ? [] : parsedContent.imageKeys.map { MessageImage(key: $0) },
             sharedChatID: deleted ? nil : parsedContent.sharedChatID,
             sharedChatName: deleted ? nil : parsedContent.sharedChatName,
@@ -340,9 +347,9 @@ public enum LarkCLIParser {
 
     private static func normalizeMarkers(_ text: String) -> String {
         let normalized = text
-            .replacingOccurrences(of: #"!\[Image\]\(img_[A-Za-z0-9_-]+\)"#, with: "[图片]", options: .regularExpression)
-            .replacingOccurrences(of: #"\[Image:\s*img_[A-Za-z0-9_-]+\]"#, with: "[图片]", options: [.regularExpression, .caseInsensitive])
-            .replacingOccurrences(of: #"\[Image\]\(img_[A-Za-z0-9_-]+\)"#, with: "[图片]", options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: #"\[Image:\s*(img_[A-Za-z0-9_-]+)\]"#, with: "![Image]($1)", options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: #"(?<!!)\[Image\]\((img_[A-Za-z0-9_-]+)\)"#, with: "![Image]($1)", options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: #"(?:🖼️\s*)?Image\(img_key:\s*(img_[A-Za-z0-9_-]+)\)"#, with: "![Image]($1)", options: [.regularExpression, .caseInsensitive])
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return normalized.isEmpty ? "[图片]" : normalized
     }
@@ -363,7 +370,7 @@ public enum LarkCLIParser {
             .replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
             .replacingOccurrences(of: #"\s*\(ou_[A-Za-z0-9_-]+\)"#, with: "", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        body = decodeBasicEntities(in: body)
+        body = normalizeMarkers(decodeBasicEntities(in: body))
         let titleText = title.map { decodeBasicEntities(in: $0) }?.trimmingCharacters(in: .whitespacesAndNewlines)
         return [titleText.map { "**\($0)**" }, body.isEmpty ? nil : body]
             .compactMap { $0 }
@@ -401,8 +408,17 @@ public enum LarkCLIParser {
     }
 
     private static func imageKeys(in text: String) -> [String] {
-        matches(in: text, pattern: #"img_[A-Za-z0-9_-]+"#)
+        let patterns = [
+            #"!\[Image\]\((img_[A-Za-z0-9_-]+)\)"#,
+            #"\[Image:\s*(img_[A-Za-z0-9_-]+)\]"#,
+            #"Image\(img_key:\s*(img_[A-Za-z0-9_-]+)\)"#
+        ]
+        return patterns
+            .flatMap { matches(in: text, pattern: $0, captureGroup: 1) }
             .compactMap(validImageKey)
+            .reduce(into: []) { result, key in
+                if !result.contains(key) { result.append(key) }
+            }
     }
 
     private static func sharedChatID(in text: String) -> String? {
@@ -412,7 +428,10 @@ public enum LarkCLIParser {
     }
 
     private static func validImageKey(_ value: String) -> String? {
-        value.range(of: #"^img_[A-Za-z0-9_-]+$"#, options: .regularExpression) == nil ? nil : value
+        guard value != "img_key",
+              value.range(of: #"^img_[A-Za-z0-9_-]+$"#, options: .regularExpression) != nil
+        else { return nil }
+        return value
     }
 
     private static func validChatID(_ value: String) -> String? {
@@ -444,6 +463,9 @@ public enum LarkCLIParser {
         }
         func collect(_ value: Any) {
             if let dictionary = value as? [String: Any] {
+                if let key = dictionary["image_key"] as? String, let key = validImageKey(key) {
+                    append(imageMarker(for: key))
+                }
                 if let content = dictionary["content"] as? String { append(content) }
                 if let text = dictionary["text"] as? String { append(text) }
                 if let title = dictionary["title"] as? String { append(title) }
@@ -460,6 +482,10 @@ public enum LarkCLIParser {
         if let elements = object["elements"] { collect(elements) }
         if parts.isEmpty { collect(object) }
         return parts.isEmpty ? nil : parts.joined(separator: "\n")
+    }
+
+    private static func imageMarker(for key: String) -> String {
+        "![Image](\(key))"
     }
 
     private static func placeholder(for type: String) -> String {

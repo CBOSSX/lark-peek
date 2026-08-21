@@ -1,6 +1,11 @@
 import Foundation
 
 public enum MessageMarkdown {
+    public enum ContentPart: Equatable, Sendable {
+        case text(String)
+        case image(key: String)
+    }
+
     public struct Block: Equatable, Sendable {
         public enum Kind: Equatable, Sendable {
             case paragraph
@@ -79,6 +84,37 @@ public enum MessageMarkdown {
         return blocks
     }
 
+    /// Splits message text and its downloaded resources into display order.
+    /// Images without an inline marker are appended as a compatibility fallback.
+    public static func contentParts(from source: String, imageKeys: [String]) -> [ContentPart] {
+        let knownKeys = Set(imageKeys)
+        let pattern = #"!\[Image\]\((img_[A-Za-z0-9_-]+)\)"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else {
+            return fallbackContentParts(source: source, imageKeys: imageKeys)
+        }
+
+        var parts: [ContentPart] = []
+        var usedKeys: Set<String> = []
+        var cursor = source.startIndex
+        let matches = expression.matches(in: source, range: NSRange(source.startIndex..., in: source))
+
+        for match in matches {
+            guard let markerRange = Range(match.range(at: 0), in: source),
+                  let keyRange = Range(match.range(at: 1), in: source) else { continue }
+            let key = String(source[keyRange])
+            guard knownKeys.contains(key) else { continue }
+            appendText(String(source[cursor..<markerRange.lowerBound]), to: &parts)
+            parts.append(.image(key: key))
+            usedKeys.insert(key)
+            cursor = markerRange.upperBound
+        }
+        appendText(String(source[cursor...]), to: &parts)
+        for key in imageKeys where !usedKeys.contains(key) {
+            parts.append(.image(key: key))
+        }
+        return parts
+    }
+
     static func normalizeHTMLParagraphs(in source: String) -> String {
         guard source.range(of: #"<\s*/?\s*p(?:\s[^>]*)?>"#, options: [.regularExpression, .caseInsensitive]) != nil
                 || source.range(of: #"<\s*br\s*/?\s*>"#, options: [.regularExpression, .caseInsensitive]) != nil
@@ -112,5 +148,18 @@ public enum MessageMarkdown {
 
     private static func indentationLevel(_ whitespace: String) -> Int {
         whitespace.reduce(0) { $0 + ($1 == "\t" ? 2 : 1) } / 2
+    }
+
+    private static func fallbackContentParts(source: String, imageKeys: [String]) -> [ContentPart] {
+        var parts: [ContentPart] = []
+        appendText(source, to: &parts)
+        parts.append(contentsOf: imageKeys.map { .image(key: $0) })
+        return parts
+    }
+
+    private static func appendText(_ source: String, to parts: inout [ContentPart]) {
+        let text = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, text != "[图片]" else { return }
+        parts.append(.text(text))
     }
 }

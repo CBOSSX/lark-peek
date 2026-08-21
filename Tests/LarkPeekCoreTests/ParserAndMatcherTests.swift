@@ -41,11 +41,60 @@ import Testing
     let json = #"{"ok":true,"data":{"messages":[{"message_id":"om_image","msg_type":"image","create_time":"1786400000000","sender":{"name":"A"},"content":"{\"image_key\":\"img_safe\"}"},{"message_id":"om_marker","msg_type":"text","create_time":"1786400000001","sender":{"name":"A"},"content":"[Image: img_v3_from_cli]"},{"message_id":"om_file","msg_type":"file","create_time":"1786400000002","sender":{"name":"A"},"content":"{\"file_name\":\"plan.pdf\"}"}]}}"#
     let messages = try LarkCLIParser.messages(from: Data(json.utf8), fallbackChatID: "oc_1")
 
-    #expect(messages[0].content == "[图片]")
+    #expect(messages[0].content == "![Image](img_safe)")
     #expect(messages[0].images.map(\.key) == ["img_safe"])
-    #expect(messages[1].content == "[图片]")
+    #expect(messages[1].content == "![Image](img_v3_from_cli)")
     #expect(messages[1].images.map(\.key) == ["img_v3_from_cli"])
     #expect(messages[2].content == "附件：plan.pdf")
+}
+
+@Test func keepsInlineImagesInMessageOrderAndRejectsTheImgKeyLabel() throws {
+    let content = """
+    <card title="产品更新">
+    第一段
+    🖼️ Image(img_key:img_v3_first)
+    中间说明
+    Image(img_key:img_v3_second)
+    最后一段
+    </card>
+    """
+    let contentData = try JSONEncoder().encode(content)
+    let encodedContent = try #require(String(data: contentData, encoding: .utf8))
+    let json = #"{"ok":true,"data":{"messages":[{"message_id":"om_card_images","msg_type":"interactive","content":\#(encodedContent)}]}}"#
+    let message = try #require(LarkCLIParser.messages(from: Data(json.utf8), fallbackChatID: "oc_1").first)
+
+    #expect(message.images.map(\.key) == ["img_v3_first", "img_v3_second"])
+    #expect(!message.images.map(\.key).contains("img_key"))
+    #expect(MessageMarkdown.contentParts(from: message.content, imageKeys: message.images.map(\.key)) == [
+        .text("**产品更新**\n第一段"),
+        .image(key: "img_v3_first"),
+        .text("中间说明"),
+        .image(key: "img_v3_second"),
+        .text("最后一段")
+    ])
+}
+
+@Test func appendsOnlyImagesWithoutAnInlinePositionAsFallback() {
+    #expect(MessageMarkdown.contentParts(
+        from: "开头\n![Image](img_inline)\n结尾",
+        imageKeys: ["img_inline", "img_unpositioned"]
+    ) == [
+        .text("开头"),
+        .image(key: "img_inline"),
+        .text("结尾"),
+        .image(key: "img_unpositioned")
+    ])
+}
+
+@Test func keepsStructuredCardImagesBetweenTheirNeighboringTextBlocks() throws {
+    let json = #"{"ok":true,"data":{"messages":[{"message_id":"om_structured_card","msg_type":"interactive","content":"{\"elements\":[{\"tag\":\"div\",\"text\":{\"content\":\"图片之前\"}},{\"tag\":\"img\",\"image_key\":\"img_v3_middle\"},{\"tag\":\"div\",\"text\":{\"content\":\"图片之后\"}}]}"}]}}"#
+    let message = try #require(LarkCLIParser.messages(from: Data(json.utf8), fallbackChatID: "oc_1").first)
+
+    #expect(MessageMarkdown.contentParts(from: message.content, imageKeys: message.images.map(\.key)) == [
+        .text("图片之前"),
+        .image(key: "img_v3_middle"),
+        .text("图片之后")
+    ])
 }
 
 @Test func extractsInteractiveCardTextAndSharedChatMetadata() throws {
