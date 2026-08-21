@@ -18,6 +18,9 @@ import Testing
     #expect(try ReadOnlyCommand.recentMessages(chatID: "oc_safe", pageToken: "older-page").arguments() == [
         "im", "+chat-messages-list", "--as", "user", "--chat-id", "oc_safe", "--order", "desc", "--page-size", "20", "--no-reactions", "--format", "json", "--page-token", "older-page"
     ])
+    #expect(try ReadOnlyCommand.threadMessages(threadID: "omt_safe").arguments() == [
+        "im", "+threads-messages-list", "--as", "user", "--thread", "omt_safe", "--order", "asc", "--page-size", "50", "--no-reactions", "--format", "json"
+    ])
     #expect(try ReadOnlyCommand.messageImage(
         messageID: "om_safe",
         fileKey: "img_safe",
@@ -35,6 +38,7 @@ import Testing
     #expect(throws: (any Error).self) { try ReadOnlyCommand.recentChats(pageToken: "next\n--yes").arguments() }
     #expect(throws: (any Error).self) { try ReadOnlyCommand.searchChats(query: "").arguments() }
     #expect(throws: (any Error).self) { try ReadOnlyCommand.searchChats(query: String(repeating: "x", count: 65)).arguments() }
+    #expect(throws: (any Error).self) { try ReadOnlyCommand.threadMessages(threadID: "omt_safe\n--yes").arguments() }
     #expect(throws: (any Error).self) {
         try ReadOnlyCommand.messageImage(messageID: "om_safe", fileKey: "img_safe", outputPath: "../escape").arguments()
     }
@@ -49,6 +53,7 @@ import Testing
         .chatDetails(chatID: "oc_safe"),
         .recentMessages(chatID: "oc_safe"),
         .recentMessages(chatID: "oc_safe", pageToken: "older-page"),
+        .threadMessages(threadID: "omt_safe"),
         .messageImage(messageID: "om_safe", fileKey: "img_safe", outputPath: "lark-peek-image-safe")
     ]
     let forbidden = [
@@ -59,4 +64,11 @@ import Testing
         let normalized = arguments.map { $0.lowercased() }
         for word in forbidden { #expect(!normalized.contains(word), "Unexpected write capability in \(arguments)") }
     }
+}
+
+@Test func keychainFailureExplainsRecoveryWithoutRequestingRelogin() {
+    let description = LarkCLIError.keychainAccessBlocked.localizedDescription
+    #expect(description.contains("解锁 login 钥匙串"))
+    #expect(description.contains("登录数据仍然保留"))
+    #expect(!description.contains("重新登录"))
 }

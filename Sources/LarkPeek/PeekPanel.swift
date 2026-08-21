@@ -453,66 +453,78 @@ private struct MessageTimelineView: View {
 
     @State private var initializedChatID: String?
     @State private var loadTask: Task<Void, Never>?
-    @State private var scrollPositionID: String?
 
     private var chatID: String? { messages.first?.chatID }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
-                if model.hasOlderMessages {
-                    olderMessagesTrigger
-                }
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    if messages.isEmpty {
-                        ContentUnavailableView("没有可显示的消息", systemImage: "bubble.left")
-                            .frame(maxWidth: .infinity)
-                            .padding(.top, 110)
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    if model.hasOlderMessages {
+                        olderMessagesTrigger(using: proxy)
                     }
-                    ForEach(messages) { message in
-                        messageRow(message)
-                            .padding(.bottom, message.id == messages.last?.id ? 8 : 0)
-                            .id(message.id)
+                    // The initial page is capped at 20 messages. Eagerly laying
+                    // them out lets the bottom anchor measure the real document
+                    // height before choosing its initial viewport. A LazyVStack
+                    // can leave the bottom rows unrealized and produce an empty
+                    // viewport for tall conversations.
+                    VStack(alignment: .leading, spacing: 10) {
+                        if messages.isEmpty {
+                            ContentUnavailableView("没有可显示的消息", systemImage: "bubble.left")
+                                .frame(maxWidth: .infinity)
+                                .padding(.top, 110)
+                        }
+                        ForEach(messages) { message in
+                            messageRow(message)
+                                .padding(.bottom, message.id == messages.last?.id ? 8 : 0)
+                                .id(message.id)
+                                .onAppear {
+                                    guard message.id == messages.first?.id
+                                            || message.id == messages.last?.id else { return }
+                                    timelineLogger.info(
+                                        "Timeline boundary row appeared chat=\(chatID ?? "none", privacy: .private(mask: .hash)) message=\(message.id, privacy: .private(mask: .hash)) count=\(messages.count)"
+                                    )
+                                }
+                        }
                     }
                 }
-                .scrollTargetLayout()
-            }
-            .padding(.horizontal, 14)
-            .background {
-                ScrollTopObserver {
-                    guard initializedChatID == chatID else { return }
-                    timelineLogger.debug(
-                        "Reached timeline top chat=\(chatID ?? "none", privacy: .private(mask: .hash)) count=\(messages.count)"
-                    )
-                    loadOlderMessages()
+                .padding(.horizontal, 14)
+                .background {
+                    ScrollTopObserver {
+                        guard initializedChatID == chatID else { return }
+                        timelineLogger.debug(
+                            "Reached timeline top chat=\(chatID ?? "none", privacy: .private(mask: .hash)) count=\(messages.count)"
+                        )
+                        loadOlderMessages(using: proxy)
+                    }
                 }
             }
-        }
-        // Establish the initial viewport during SwiftUI's first layout pass,
-        // instead of rendering at the top and scrolling down a frame later.
-        .defaultScrollAnchor(.bottom)
-        .scrollPosition(id: $scrollPositionID, anchor: .top)
-        .task(id: chatID) {
-            initializedChatID = nil
-            await Task.yield()
-            guard !Task.isCancelled else { return }
-            initializedChatID = chatID
-            timelineLogger.info(
-                "Timeline initialized with bottom anchor chat=\(chatID ?? "none", privacy: .private(mask: .hash)) count=\(messages.count)"
-            )
-        }
-        .onDisappear {
-            if loadTask != nil {
-                timelineLogger.debug(
-                    "Cancelling older-message UI task chat=\(chatID ?? "none", privacy: .private(mask: .hash))"
+            // Establish the initial viewport during SwiftUI's first layout pass.
+            // ScrollViewReader is retained only for restoring the visible anchor
+            // after prepending an older page; it does not drive initial scrolling.
+            .defaultScrollAnchor(.bottom)
+            .task(id: chatID) {
+                initializedChatID = nil
+                await Task.yield()
+                guard !Task.isCancelled else { return }
+                initializedChatID = chatID
+                timelineLogger.info(
+                    "Timeline initialized with eager bottom layout chat=\(chatID ?? "none", privacy: .private(mask: .hash)) count=\(messages.count)"
                 )
             }
-            loadTask?.cancel()
-            loadTask = nil
+            .onDisappear {
+                if loadTask != nil {
+                    timelineLogger.debug(
+                        "Cancelling older-message UI task chat=\(chatID ?? "none", privacy: .private(mask: .hash))"
+                    )
+                }
+                loadTask?.cancel()
+                loadTask = nil
+            }
         }
     }
 
-    private var olderMessagesTrigger: some View {
+    private func olderMessagesTrigger(using proxy: ScrollViewProxy) -> some View {
         HStack {
             Spacer()
             if model.isLoadingOlderMessages {
@@ -522,7 +534,7 @@ private struct MessageTimelineView: View {
                     timelineLogger.debug(
                         "Manual older-message request chat=\(chatID ?? "none", privacy: .private(mask: .hash)) count=\(messages.count)"
                     )
-                    loadOlderMessages()
+                    loadOlderMessages(using: proxy)
                 }
                 .buttonStyle(.plain)
                 .font(.system(size: 11))
@@ -533,7 +545,7 @@ private struct MessageTimelineView: View {
         .frame(height: 24)
     }
 
-    private func loadOlderMessages() {
+    private func loadOlderMessages(using proxy: ScrollViewProxy) {
         guard loadTask == nil else {
             timelineLogger.debug("Ignoring duplicate older-message UI request: task already active")
             return
@@ -547,10 +559,6 @@ private struct MessageTimelineView: View {
             return
         }
         let previousCount = messages.count
-        // Keep the currently first message bound to the top edge while older
-        // rows are inserted before it. This avoids rendering an intermediate
-        // frame at the newly expanded content offset and then jumping back.
-        scrollPositionID = anchorID
         timelineLogger.info(
             "Preserving timeline position while loading older messages chat=\(chatID ?? "none", privacy: .private(mask: .hash)) anchor=\(anchorID, privacy: .private(mask: .hash)) count=\(previousCount)"
         )
@@ -561,6 +569,12 @@ private struct MessageTimelineView: View {
                 loadTask = nil
                 return
             }
+            await Task.yield()
+            guard !Task.isCancelled else {
+                loadTask = nil
+                return
+            }
+            proxy.scrollTo(anchorID, anchor: .top)
             let currentCount: Int
             if case let .messages(_, _, currentMessages, _) = model.state {
                 currentCount = currentMessages.count
@@ -615,12 +629,28 @@ private struct MessageContentView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if message.sharedChatID != nil {
+            MessageBodyView(message: message)
+            if message.threadID != nil {
+                TopicRepliesCard(message: message)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+private struct MessageBodyView: View {
+    let message: LarkMessage
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !message.forwardedMessages.isEmpty {
+                ForwardedMessagesCard(items: message.forwardedMessages)
+            } else if message.sharedChatID != nil {
                 sharedChatCard
             } else if message.type == "interactive" {
                 interactiveCard
             } else if !displayContent.isEmpty {
-                markdownText(displayContent)
+                MarkdownMessageView(content: displayContent)
             }
 
             ForEach(message.images, id: \.key) { image in
@@ -640,7 +670,7 @@ private struct MessageContentView: View {
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             } else {
-                markdownText(displayContent)
+                MarkdownMessageView(content: displayContent)
             }
         }
         .padding(10)
@@ -670,10 +700,6 @@ private struct MessageContentView: View {
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.teal.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
-    }
-
-    private func markdownText(_ content: String) -> some View {
-        MarkdownMessageView(content: content)
     }
 
     private var displayContent: String {
@@ -708,6 +734,188 @@ private struct MessageContentView: View {
             .foregroundStyle(.secondary)
         }
     }
+}
+
+private struct ForwardedMessagesCard: View {
+    let items: [ForwardedMessageItem]
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeOut(duration: 0.16)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "text.bubble.fill")
+                    Text("聊天记录")
+                        .fontWeight(.semibold)
+                    Spacer()
+                    Text("\(items.count) 条")
+                        .foregroundStyle(.secondary)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                }
+                .contentShape(Rectangle())
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .font(.system(size: 11))
+            .foregroundStyle(.purple)
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(items.enumerated()), id: \.offset) { index, item in
+                        if index > 0 {
+                            Divider().opacity(0.55)
+                        }
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 6) {
+                                Text(item.senderName)
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(SenderAvatar.color(for: item.senderName))
+                                if let time = item.createTime {
+                                    Text(Self.timeFormatter.string(from: time))
+                                        .font(.system(size: 9))
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                            if !item.content.isEmpty {
+                                MarkdownMessageView(content: item.content)
+                            }
+                        }
+                        .padding(.vertical, 7)
+                    }
+                }
+                .padding(.top, 8)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.purple.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.purple.opacity(0.17), lineWidth: 1)
+        }
+    }
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.dateFormat = "MM-dd HH:mm"
+        return formatter
+    }()
+}
+
+private struct TopicRepliesCard: View {
+    let message: LarkMessage
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(.easeOut(duration: 0.16)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "bubble.left.and.bubble.right.fill")
+                    Text("话题回复")
+                        .fontWeight(.semibold)
+                    Spacer()
+                    if !message.threadRepliesLoaded {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Text(replyCountLabel)
+                            .foregroundStyle(.secondary)
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                }
+                .contentShape(Rectangle())
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .font(.system(size: 11))
+            .foregroundStyle(.blue)
+
+            if isExpanded {
+                if message.threadRepliesLoaded {
+                    if message.threadReplies.isEmpty {
+                        Text("暂未读到回复")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(message.threadReplies) { reply in
+                            replyRow(reply)
+                        }
+                        if message.threadHasMore {
+                            Text("回复较多，当前展示前 50 条")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                } else {
+                    Text("正在读取话题回复…")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.blue.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.blue.opacity(0.15), lineWidth: 1)
+        }
+    }
+
+    private var replyCountLabel: String {
+        "\(message.threadReplies.count)\(message.threadHasMore ? "+" : "") 条"
+    }
+
+    private func replyRow(_ reply: LarkMessage) -> some View {
+        HStack(alignment: .top, spacing: 7) {
+            SenderAvatar(name: reply.sender.name)
+                .scaleEffect(0.75, anchor: .topLeading)
+                .frame(width: 23, height: 23)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(reply.sender.name)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(SenderAvatar.color(for: reply.sender.name))
+                    Text(Self.timeFormatter.string(from: reply.createTime))
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                    if reply.updated {
+                        Text("已编辑")
+                            .font(.system(size: 8))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                MessageBodyView(message: reply)
+            }
+        }
+        .padding(7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.dateFormat = "MM-dd HH:mm"
+        return formatter
+    }()
 }
 
 private struct MarkdownMessageView: View {

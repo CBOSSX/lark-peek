@@ -30,6 +30,7 @@ public enum ReadOnlyCommand: Equatable, Sendable {
     case searchChats(query: String, pageSize: Int = 20)
     case chatDetails(chatID: String)
     case recentMessages(chatID: String, pageToken: String? = nil, pageSize: Int = 20)
+    case threadMessages(threadID: String, pageToken: String? = nil, pageSize: Int = 50)
     /// Performs a server-side GET and writes only to an app-controlled temporary file.
     case messageImage(messageID: String, fileKey: String, outputPath: String)
 
@@ -87,6 +88,20 @@ public enum ReadOnlyCommand: Equatable, Sendable {
             try appendPageToken(pageToken, to: &arguments)
             return arguments
 
+        case let .threadMessages(threadID, pageToken, pageSize):
+            try validateThreadID(threadID)
+            var arguments = [
+                "im", "+threads-messages-list",
+                "--as", "user",
+                "--thread", threadID,
+                "--order", "asc",
+                "--page-size", String(min(max(pageSize, 1), 50)),
+                "--no-reactions",
+                "--format", "json"
+            ]
+            try appendPageToken(pageToken, to: &arguments)
+            return arguments
+
         case let .messageImage(messageID, fileKey, outputPath):
             try validateMessageID(messageID)
             try validateImageKey(fileKey)
@@ -129,6 +144,12 @@ public enum ReadOnlyCommand: Equatable, Sendable {
         }
     }
 
+    private func validateThreadID(_ value: String) throws {
+        guard isSafeIdentifier(value, prefix: "omt_") || isSafeIdentifier(value, prefix: "om_") else {
+            throw CommandPolicyError.invalidIdentifier
+        }
+    }
+
     private func validateImageKey(_ value: String) throws {
         guard isSafeIdentifier(value, prefix: "img_") else {
             throw CommandPolicyError.invalidResourceKey
@@ -144,6 +165,7 @@ public enum ReadOnlyCommand: Equatable, Sendable {
 
 public enum LarkCLIError: LocalizedError, Equatable {
     case executableNotFound
+    case keychainAccessBlocked
     case executionFailed(String)
     case malformedResponse
     case authorization(message: String, missingScopes: [String])
@@ -151,6 +173,8 @@ public enum LarkCLIError: LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .executableNotFound: "未找到 lark-cli。请从菜单栏为 Lark Peek 选择它的位置。"
+        case .keychainAccessBlocked:
+            "无法读取 macOS 登录钥匙串。请先在“钥匙串访问”中解锁 login 钥匙串，再点重试；现有 lark-cli 登录数据仍然保留。"
         case let .executionFailed(message): message
         case .malformedResponse: "lark-cli 返回了无法解析的数据。"
         case let .authorization(message, missing):

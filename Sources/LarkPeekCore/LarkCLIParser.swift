@@ -129,6 +129,8 @@ public enum LarkCLIParser {
             images: deleted ? [] : parsedContent.imageKeys.map { MessageImage(key: $0) },
             sharedChatID: deleted ? nil : parsedContent.sharedChatID,
             sharedChatName: deleted ? nil : parsedContent.sharedChatName,
+            forwardedMessages: deleted ? [] : parsedContent.forwardedMessages,
+            threadID: deleted ? nil : validThreadID(row["thread_id"] as? String),
             deleted: deleted,
             updated: row["updated"] as? Bool ?? false
         )
@@ -188,6 +190,7 @@ public enum LarkCLIParser {
         let imageKeys: [String]
         let sharedChatID: String?
         let sharedChatName: String?
+        let forwardedMessages: [ForwardedMessageItem]
     }
 
     private static func readableContent(_ raw: String, type: String) -> ReadableContent {
@@ -196,7 +199,18 @@ public enum LarkCLIParser {
                 text: markup,
                 imageKeys: imageKeys(in: raw),
                 sharedChatID: sharedChatID(in: raw),
-                sharedChatName: nil
+                sharedChatName: nil,
+                forwardedMessages: []
+            )
+        }
+        if type == "merge_forward" {
+            let items = forwardedMessageItems(in: raw)
+            return ReadableContent(
+                text: items.isEmpty ? placeholder(for: type) : "合并转发 · \(items.count) 条消息",
+                imageKeys: imageKeys(in: raw),
+                sharedChatID: nil,
+                sharedChatName: nil,
+                forwardedMessages: items
             )
         }
         guard let data = raw.data(using: .utf8),
@@ -206,7 +220,8 @@ public enum LarkCLIParser {
                 text: raw.isEmpty ? placeholder(for: type) : normalizeMarkers(raw),
                 imageKeys: imageKeys(in: raw),
                 sharedChatID: sharedChatID(in: raw),
-                sharedChatName: nil
+                sharedChatName: nil,
+                forwardedMessages: []
             )
         }
 
@@ -232,8 +247,50 @@ public enum LarkCLIParser {
             text: text,
             imageKeys: images,
             sharedChatID: sharedChatID,
-            sharedChatName: sharedChatName
+            sharedChatName: sharedChatName,
+            forwardedMessages: []
         )
+    }
+
+    private static func forwardedMessageItems(in text: String) -> [ForwardedMessageItem] {
+        let headerPattern = #"^\[([^\]]+)\]\s+(.+):\s*$"#
+        guard let header = try? NSRegularExpression(pattern: headerPattern) else { return [] }
+        var items: [ForwardedMessageItem] = []
+        var currentTime: Date?
+        var currentSender: String?
+        var body: [String] = []
+
+        func flush() {
+            guard let sender = currentSender else { return }
+            let content = body
+                .map { line in
+                    if line.hasPrefix("    ") { return String(line.dropFirst(4)) }
+                    return line.trimmingCharacters(in: .whitespaces)
+                }
+                .joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            items.append(ForwardedMessageItem(createTime: currentTime, senderName: sender, content: content))
+        }
+
+        for lineSlice in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(lineSlice)
+            if line.range(of: #"^\s*</?forwarded_messages>\s*$"#, options: [.regularExpression, .caseInsensitive]) != nil {
+                continue
+            }
+            let range = NSRange(line.startIndex..., in: line)
+            if let match = header.firstMatch(in: line, range: range),
+               let timeRange = Range(match.range(at: 1), in: line),
+               let senderRange = Range(match.range(at: 2), in: line) {
+                flush()
+                currentTime = parseDate(String(line[timeRange]))
+                currentSender = String(line[senderRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                body = []
+            } else if currentSender != nil {
+                body.append(line)
+            }
+        }
+        flush()
+        return items
     }
 
     private static func normalizeMarkers(_ text: String) -> String {
@@ -317,6 +374,11 @@ public enum LarkCLIParser {
         value.range(of: #"^oc_[A-Za-z0-9_-]+$"#, options: .regularExpression) == nil ? nil : value
     }
 
+    private static func validThreadID(_ value: String?) -> String? {
+        guard let value else { return nil }
+        return value.range(of: #"^omt?_[A-Za-z0-9_-]+$"#, options: .regularExpression) == nil ? nil : value
+    }
+
     private static func matches(in text: String, pattern: String, captureGroup: Int = 0) -> [String] {
         guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
         let range = NSRange(text.startIndex..., in: text)
@@ -364,6 +426,7 @@ public enum LarkCLIParser {
         case "interactive": "[互动卡片]"
         case "sticker": "[表情包]"
         case "system": "[系统消息]"
+        case "merge_forward": "[合并转发消息]"
         default: "[暂不支持的消息类型]"
         }
     }

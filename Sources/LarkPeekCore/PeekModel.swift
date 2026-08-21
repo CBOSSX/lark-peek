@@ -184,13 +184,14 @@ public final class PeekModel: ObservableObject {
             }
             let mergedMessages = MessageTimeline.merging(page.messages, into: currentMessages)
             let namedMessages = await resolveSharedChatNames(in: mergedMessages, using: client)
+            let threadedMessages = await hydrateThreadReplies(in: namedMessages, using: client)
             state = .messages(
                 conversation,
                 chat,
-                namedMessages,
+                threadedMessages,
                 Date()
             )
-            let hydratedMessages = await downloadImages(in: namedMessages, using: client)
+            let hydratedMessages = await downloadImages(in: threadedMessages, using: client)
             guard case let .messages(_, hydratedChat, _, _) = state,
                   hydratedChat.id == chat.id else { return }
             state = .messages(conversation, chat, hydratedMessages, Date())
@@ -223,7 +224,33 @@ public final class PeekModel: ObservableObject {
         let messages = [
             LarkMessage(id: "om_preview_1", chatID: chat.id, createTime: now.addingTimeInterval(-320), sender: MessageSender(name: "林澈"), content: "<p>新的 **Markdown** 预览已经可以体验了。</p><p>- 无序列表\n  - 嵌套列表\n> 引用内容</p>"),
             LarkMessage(id: "om_preview_2", chatID: chat.id, type: "interactive", createTime: now.addingTimeInterval(-180), sender: MessageSender(name: "周然"), content: "**体验提醒**\n鼠标停在飞书会话上，长按 ⌥，或按 ⌃⌥P 查看最近消息。"),
-            LarkMessage(id: "om_preview_3", chatID: chat.id, type: "share_chat", createTime: now.addingTimeInterval(-45), sender: MessageSender(name: "Lark Peek"), content: "分享了一个群聊", sharedChatID: "oc_preview_shared", sharedChatName: "产品设计交流群")
+            LarkMessage(
+                id: "om_preview_3",
+                chatID: chat.id,
+                type: "merge_forward",
+                createTime: now.addingTimeInterval(-120),
+                sender: MessageSender(name: "周然"),
+                content: "合并转发 · 3 条消息",
+                forwardedMessages: [
+                    ForwardedMessageItem(createTime: now.addingTimeInterval(-900), senderName: "林澈", content: "第一条转发内容"),
+                    ForwardedMessageItem(createTime: now.addingTimeInterval(-840), senderName: "周然", content: "支持 **Markdown** 和多行正文"),
+                    ForwardedMessageItem(createTime: now.addingTimeInterval(-780), senderName: "林澈", content: "阅读起来更像聊天记录")
+                ]
+            ),
+            LarkMessage(
+                id: "om_preview_4",
+                chatID: chat.id,
+                createTime: now.addingTimeInterval(-75),
+                sender: MessageSender(name: "林澈"),
+                content: "这个方案大家觉得怎么样？",
+                threadID: "omt_preview",
+                threadReplies: [
+                    LarkMessage(id: "om_preview_reply_1", chatID: chat.id, createTime: now.addingTimeInterval(-65), sender: MessageSender(name: "周然"), content: "信息层级清楚多了。"),
+                    LarkMessage(id: "om_preview_reply_2", chatID: chat.id, createTime: now.addingTimeInterval(-55), sender: MessageSender(name: "林澈"), content: "那就按这个方向继续。")
+                ],
+                threadRepliesLoaded: true
+            ),
+            LarkMessage(id: "om_preview_5", chatID: chat.id, type: "share_chat", createTime: now.addingTimeInterval(-45), sender: MessageSender(name: "Lark Peek"), content: "分享了一个群聊", sharedChatID: "oc_preview_shared", sharedChatName: "产品设计交流群")
         ]
         state = .messages(conversation, chat, messages, now)
         statusMessage = "视觉预览模式"
@@ -324,7 +351,12 @@ public final class PeekModel: ObservableObject {
         guard case let .messages(_, namedChat, _, _) = state,
               namedChat.id == chat.id else { return }
         state = .messages(conversation, chat, namedMessages, Date())
-        let hydratedMessages = await downloadImages(in: namedMessages, using: client)
+        let threadedMessages = await hydrateThreadReplies(in: namedMessages, using: client)
+        try Task.checkCancellation()
+        guard case let .messages(_, threadedChat, _, _) = state,
+              threadedChat.id == chat.id else { return }
+        state = .messages(conversation, chat, threadedMessages, Date())
+        let hydratedMessages = await downloadImages(in: threadedMessages, using: client)
         try Task.checkCancellation()
         guard case let .messages(_, visibleChat, _, _) = state,
               visibleChat.id == chat.id else { return }
@@ -391,8 +423,54 @@ public final class PeekModel: ObservableObject {
         let data: Data?
     }
 
+    private func hydrateThreadReplies(
+        in messages: [LarkMessage],
+        using client: LarkCLIClient
+    ) async -> [LarkMessage] {
+        let threadIDs = Array(Set(messages.compactMap { message -> String? in
+            guard !message.threadRepliesLoaded else { return nil }
+            return message.threadID
+        }))
+        guard !threadIDs.isEmpty else { return messages }
+
+        var pages: [String: LarkCLIParser.MessagePage] = [:]
+        for start in stride(from: 0, to: threadIDs.count, by: 3) {
+            if Task.isCancelled { return messages }
+            let batch = Array(threadIDs[start..<min(start + 3, threadIDs.count)])
+            let results = await withTaskGroup(of: (String, LarkCLIParser.MessagePage?).self) { group in
+                for threadID in batch {
+                    group.addTask {
+                        guard let result = try? await client.run(.threadMessages(threadID: threadID)),
+                              let page = try? LarkCLIParser.messagePage(from: result.data, fallbackChatID: "")
+                        else { return (threadID, nil) }
+                        return (threadID, page)
+                    }
+                }
+                var values: [(String, LarkCLIParser.MessagePage?)] = []
+                for await value in group { values.append(value) }
+                return values
+            }
+            for (threadID, page) in results {
+                if let page { pages[threadID] = page }
+            }
+        }
+
+        let requested = Set(threadIDs)
+        return messages.map { message in
+            guard let threadID = message.threadID, requested.contains(threadID) else { return message }
+            var message = message
+            message.threadRepliesLoaded = true
+            if let page = pages[threadID] {
+                message.threadReplies = page.messages.sorted(by: LarkMessage.isChronologicallyBefore)
+                message.threadHasMore = page.nextPageToken != nil
+            }
+            return message
+        }
+    }
+
     private func downloadImages(in messages: [LarkMessage], using client: LarkCLIClient) async -> [LarkMessage] {
-        let requests = messages.flatMap { message in
+        let allMessages = messages + messages.flatMap(\.threadReplies)
+        let requests = allMessages.flatMap { message in
             message.images.compactMap { image in
                 image.data == nil && !image.attempted
                     ? ImageRequest(messageID: message.id, key: image.key)
@@ -426,13 +504,20 @@ public final class PeekModel: ObservableObject {
 
         return messages.map { message in
             var message = message
-            message.images = message.images.map { image in
-                let request = ImageRequest(messageID: message.id, key: image.key)
-                guard let result = downloaded[request] else { return image }
-                return MessageImage(key: image.key, data: result.data, attempted: true)
-            }
+            message = applying(downloaded, to: message)
+            message.threadReplies = message.threadReplies.map { applying(downloaded, to: $0) }
             return message
         }
+    }
+
+    private func applying(_ downloaded: [ImageRequest: ImageDownload], to message: LarkMessage) -> LarkMessage {
+        var message = message
+        message.images = message.images.map { image in
+            let request = ImageRequest(messageID: message.id, key: image.key)
+            guard let result = downloaded[request] else { return image }
+            return MessageImage(key: image.key, data: result.data, attempted: true)
+        }
+        return message
     }
 
     private nonisolated static func downloadImage(

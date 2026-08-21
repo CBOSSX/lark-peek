@@ -68,6 +68,18 @@ public struct MessageImage: Codable, Hashable, Sendable {
     }
 }
 
+public struct ForwardedMessageItem: Codable, Hashable, Sendable {
+    public var createTime: Date?
+    public var senderName: String
+    public var content: String
+
+    public init(createTime: Date? = nil, senderName: String, content: String) {
+        self.createTime = createTime
+        self.senderName = senderName
+        self.content = content
+    }
+}
+
 public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
     public let id: String
     public var chatID: String
@@ -79,6 +91,11 @@ public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
     public var images: [MessageImage]
     public var sharedChatID: String?
     public var sharedChatName: String?
+    public var forwardedMessages: [ForwardedMessageItem]
+    public var threadID: String?
+    public var threadReplies: [LarkMessage]
+    public var threadRepliesLoaded: Bool
+    public var threadHasMore: Bool
     public var deleted: Bool
     public var updated: Bool
 
@@ -93,6 +110,11 @@ public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
         images: [MessageImage] = [],
         sharedChatID: String? = nil,
         sharedChatName: String? = nil,
+        forwardedMessages: [ForwardedMessageItem] = [],
+        threadID: String? = nil,
+        threadReplies: [LarkMessage] = [],
+        threadRepliesLoaded: Bool = false,
+        threadHasMore: Bool = false,
         deleted: Bool = false,
         updated: Bool = false
     ) {
@@ -106,6 +128,11 @@ public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
         self.images = images
         self.sharedChatID = sharedChatID
         self.sharedChatName = sharedChatName
+        self.forwardedMessages = forwardedMessages
+        self.threadID = threadID
+        self.threadReplies = threadReplies
+        self.threadRepliesLoaded = threadRepliesLoaded
+        self.threadHasMore = threadHasMore
         self.deleted = deleted
         self.updated = updated
     }

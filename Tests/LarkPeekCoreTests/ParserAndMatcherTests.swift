@@ -56,6 +56,39 @@ import Testing
     #expect(messages[1].sharedChatID == "oc_shared_123")
 }
 
+@Test func parsesMergedForwardIntoStructuredMessages() throws {
+    let forwarded = """
+    <forwarded_messages>
+    [2026-08-20T17:13:43+08:00] 何俊骞:
+        神了
+    [2026-08-20T17:18:36+08:00] 曹博淳:
+        用完了吗
+        无敌啊
+    </forwarded_messages>
+    """
+    let contentData = try JSONEncoder().encode(forwarded)
+    let encodedContent = try #require(String(data: contentData, encoding: .utf8))
+    let json = #"{"ok":true,"data":{"messages":[{"message_id":"om_forward","msg_type":"merge_forward","content":\#(encodedContent)}]}}"#
+    let message = try #require(LarkCLIParser.messages(from: Data(json.utf8), fallbackChatID: "oc_1").first)
+
+    #expect(message.content == "合并转发 · 2 条消息")
+    #expect(message.forwardedMessages.map(\.senderName) == ["何俊骞", "曹博淳"])
+    #expect(message.forwardedMessages.map(\.content) == ["神了", "用完了吗\n无敌啊"])
+    #expect(message.forwardedMessages.allSatisfy { $0.createTime != nil })
+}
+
+@Test func parsesThreadMetadataAndReplies() throws {
+    let rootJSON = #"{"ok":true,"data":{"messages":[{"message_id":"om_root","chat_id":"oc_1","msg_type":"text","thread_id":"omt_topic","content":"测试一下话题。"}]}}"#
+    let replyJSON = #"{"ok":true,"data":{"messages":[{"message_id":"om_reply","chat_id":"oc_1","msg_type":"text","thread_id":"omt_topic","thread_message_position":"0","sender":{"name":"曹博淳"},"content":"hi 你好"}],"has_more":false}}"#
+
+    let root = try #require(LarkCLIParser.messages(from: Data(rootJSON.utf8), fallbackChatID: "oc_1").first)
+    let replies = try LarkCLIParser.messagePage(from: Data(replyJSON.utf8), fallbackChatID: "oc_1")
+
+    #expect(root.threadID == "omt_topic")
+    #expect(replies.messages.map(\.content) == ["hi 你好"])
+    #expect(replies.nextPageToken == nil)
+}
+
 @Test func removesCardMarkupAndMentionIDs() throws {
     let json = #"{"ok":true,"data":{"messages":[{"message_id":"om_xml_card","msg_type":"interactive","content":"<card title=\"文档内容变更提醒\">\n@王淼 (ou_572cbf21d8d54a4bc69de598df27f44e) 编辑了文档 [来啦！](https://example.com)\n[查看变更详情](https://example.com/detail) [取消关注]\n</card>"}]}}"#
     let message = try #require(LarkCLIParser.messages(from: Data(json.utf8), fallbackChatID: "oc_1").first)
@@ -159,5 +192,7 @@ import Testing
         return
     }
     #expect(chat.name == "产品体验群")
-    #expect(messages.count == 3)
+    #expect(messages.count == 5)
+    #expect(messages[2].forwardedMessages.count == 3)
+    #expect(messages[3].threadReplies.count == 2)
 }

@@ -83,6 +83,11 @@ public actor LarkCLIClient {
         }
         let message = error["message"] as? String ?? "飞书只读请求失败。"
         let scopes = error["missing_scopes"] as? [String] ?? []
+        let normalizedMessage = message.lowercased()
+        if normalizedMessage.contains("keychain access blocked")
+            || normalizedMessage.contains("keychain not initialized") {
+            return LarkCLIError.keychainAccessBlocked
+        }
         if error["type"] as? String == "authorization" {
             return LarkCLIError.authorization(message: message, missingScopes: scopes)
         }
