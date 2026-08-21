@@ -22,6 +22,12 @@ private final class CardHostingView: NSHostingView<PeekPanelView> {
     }
 }
 
+private struct PresentedImage: Identifiable {
+    let id: String
+    let image: NSImage
+    let senderName: String
+}
+
 /// Drives the fly-in / fly-out presentation animation of the peek panel.
 @MainActor
 private final class PanelPresentation: ObservableObject {
@@ -44,6 +50,7 @@ final class PeekPanelController {
     private let model: PeekModel
     private let panel: PeekPanel
     private let presentation = PanelPresentation()
+    private lazy var imagePreviewController = ImagePreviewPanelController()
     private var closeTask: Task<Void, Never>?
 
     init(model: PeekModel) {
@@ -81,7 +88,8 @@ final class PeekPanelController {
             },
             onRetry: { [weak model] in
                 Task { @MainActor in await model?.retryCurrent() }
-            }
+            },
+            onOpenImage: { [weak self] item in self?.showPresentedImage(item) }
         ))
         // The window is resized manually (it stays enlarged to give the fly-in/out
         // animation room to render), so the hosting view must not clamp it to the
@@ -97,6 +105,7 @@ final class PeekPanelController {
     private var lastCardFrame: CGRect = .zero
 
     func show(anchor axFrame: CGRect) {
+        dismissPresentedImage()
         closeTask?.cancel()
         closeTask = nil
         let cardFrame = CGRect(origin: origin(for: axFrame, panelSize: Self.cardSize), size: Self.cardSize)
@@ -133,6 +142,7 @@ final class PeekPanelController {
     }
 
     func close() {
+        dismissPresentedImage()
         guard panel.isVisible, closeTask == nil else { return }
         // The window already covers the flight path, so the fly-out can start
         // immediately — no re-framing, no jump.
@@ -146,6 +156,20 @@ final class PeekPanelController {
             self.model.dismiss()
             self.closeTask = nil
         }
+    }
+
+    @discardableResult
+    func dismissPresentedImage() -> Bool {
+        imagePreviewController.dismiss()
+    }
+
+    func contains(_ point: CGPoint) -> Bool {
+        lastCardFrame.contains(point) || imagePreviewController.contains(point)
+    }
+
+    private func showPresentedImage(_ item: PresentedImage) {
+        let screen = NSScreen.screens.first(where: { $0.frame.intersects(lastCardFrame) }) ?? NSScreen.main
+        imagePreviewController.show(item, on: screen)
     }
 
     /// Restricts mouse interaction to the card; the transparent margin around it
@@ -226,6 +250,7 @@ private struct PeekPanelView: View {
     let onClose: () -> Void
     let onSelect: (LarkChat, HoveredConversation) -> Void
     let onRetry: () -> Void
+    let onOpenImage: (PresentedImage) -> Void
 
     private let cardShape = RoundedRectangle(cornerRadius: 16, style: .continuous)
 
@@ -353,7 +378,8 @@ private struct PeekPanelView: View {
             MessageTimelineView(
                 model: model,
                 messages: messages,
-                expandThreadsByDefault: conversation.threadHint != nil
+                expandThreadsByDefault: conversation.threadHint != nil,
+                onOpenImage: onOpenImage
             )
         case let .error(_, message):
             errorView(message)
@@ -451,10 +477,117 @@ private struct PeekPanelView: View {
 
 }
 
+private struct ImageLightboxView: View {
+    let item: PresentedImage
+    let onDismiss: () -> Void
+
+    var body: some View {
+        ZStack {
+            Button(action: onDismiss) {
+                Color.black.opacity(0.82)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("关闭图片预览背景")
+            .accessibilityIdentifier("peek-image-backdrop")
+
+            Image(nsImage: item.image)
+                .resizable()
+                .scaledToFit()
+                .contentShape(Rectangle())
+                .onTapGesture { }
+                .padding(28)
+                .accessibilityLabel("来自\(item.senderName)的图片")
+                .accessibilityIdentifier("peek-image-lightbox")
+
+            VStack {
+                HStack {
+                    Spacer()
+                    Button(action: onDismiss) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 12, weight: .bold))
+                            .frame(width: 30, height: 30)
+                            .background(.ultraThinMaterial, in: Circle())
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("关闭图片预览")
+                    .accessibilityIdentifier("peek-image-close")
+                }
+                Spacer()
+            }
+            .padding(14)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+}
+
+@MainActor
+private final class ImagePreviewPanelController {
+    private static let maximumSize = CGSize(width: 1_200, height: 900)
+    private static let screenFraction: CGFloat = 0.86
+
+    private let panel: PeekPanel
+
+    init() {
+        panel = PeekPanel(
+            contentRect: .zero,
+            styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.title = "图片预览"
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        panel.animationBehavior = .utilityWindow
+        panel.becomesKeyOnlyIfNeeded = true
+    }
+
+    func show(_ item: PresentedImage, on screen: NSScreen?) {
+        let visible = screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+            ?? CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let size = CGSize(
+            width: min(Self.maximumSize.width, visible.width * Self.screenFraction),
+            height: min(Self.maximumSize.height, visible.height * Self.screenFraction)
+        )
+        let frame = CGRect(
+            x: visible.midX - size.width / 2,
+            y: visible.midY - size.height / 2,
+            width: size.width,
+            height: size.height
+        )
+        let hostingView = NSHostingView(rootView: ImageLightboxView(
+            item: item,
+            onDismiss: { [weak self] in self?.dismiss() }
+        ))
+        hostingView.sizingOptions = []
+        panel.contentView = hostingView
+        panel.setFrame(frame, display: true)
+        panel.orderFrontRegardless()
+    }
+
+    @discardableResult
+    func dismiss() -> Bool {
+        guard panel.isVisible else { return false }
+        panel.orderOut(nil)
+        panel.contentView = nil
+        return true
+    }
+
+    func contains(_ point: CGPoint) -> Bool {
+        panel.isVisible && panel.frame.contains(point)
+    }
+}
+
 private struct MessageTimelineView: View {
     @ObservedObject var model: PeekModel
     let messages: [LarkMessage]
     let expandThreadsByDefault: Bool
+    let onOpenImage: (PresentedImage) -> Void
 
     @State private var initializedChatID: String?
     @State private var loadTask: Task<Void, Never>?
@@ -611,7 +744,8 @@ private struct MessageTimelineView: View {
                 }
                 MessageContentView(
                     message: message,
-                    expandThreadByDefault: expandThreadsByDefault
+                    expandThreadByDefault: expandThreadsByDefault,
+                    onOpenImage: onOpenImage
                 )
             }
         }
@@ -635,14 +769,16 @@ private struct MessageTimelineView: View {
 private struct MessageContentView: View {
     let message: LarkMessage
     let expandThreadByDefault: Bool
+    let onOpenImage: (PresentedImage) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            MessageBodyView(message: message)
+            MessageBodyView(message: message, onOpenImage: onOpenImage)
             if message.threadID != nil {
                 TopicRepliesCard(
                     message: message,
-                    initiallyExpanded: expandThreadByDefault
+                    initiallyExpanded: expandThreadByDefault,
+                    onOpenImage: onOpenImage
                 )
             }
         }
@@ -652,6 +788,7 @@ private struct MessageContentView: View {
 
 private struct MessageBodyView: View {
     let message: LarkMessage
+    let onOpenImage: (PresentedImage) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -731,16 +868,38 @@ private struct MessageBodyView: View {
 
     @ViewBuilder
     private func messageImage(_ image: MessageImage) -> some View {
-        if let data = image.data, let image = NSImage(data: data) {
-            Image(nsImage: image)
-                .resizable()
-                .scaledToFit()
-                .frame(maxWidth: 300, maxHeight: 240)
-                .clipShape(RoundedRectangle(cornerRadius: 9))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 9)
-                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
-                }
+        if let data = image.data, let decodedImage = NSImage(data: data) {
+            Button {
+                onOpenImage(PresentedImage(
+                    id: "\(message.id):\(image.key)",
+                    image: decodedImage,
+                    senderName: message.sender.name
+                ))
+            } label: {
+                Image(nsImage: decodedImage)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: 300, maxHeight: 240)
+                    .clipShape(RoundedRectangle(cornerRadius: 9))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 9)
+                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(6)
+                            .background(Color.black.opacity(0.58), in: Circle())
+                            .padding(7)
+                    }
+            }
+            .buttonStyle(.plain)
+            .contentShape(RoundedRectangle(cornerRadius: 9))
+            .help("点击查看大图")
+            .accessibilityLabel("打开来自\(message.sender.name)的图片预览")
+            .accessibilityHint("在浮窗中放大查看")
+            .accessibilityIdentifier("peek-image-thumbnail-\(image.key)")
         } else if image.attempted {
             Label("图片暂不可用", systemImage: "photo.badge.exclamationmark")
                 .font(.system(size: 11))
@@ -834,10 +993,16 @@ private struct ForwardedMessagesCard: View {
 
 private struct TopicRepliesCard: View {
     let message: LarkMessage
+    let onOpenImage: (PresentedImage) -> Void
     @State private var isExpanded: Bool
 
-    init(message: LarkMessage, initiallyExpanded: Bool = false) {
+    init(
+        message: LarkMessage,
+        initiallyExpanded: Bool = false,
+        onOpenImage: @escaping (PresentedImage) -> Void
+    ) {
         self.message = message
+        self.onOpenImage = onOpenImage
         _isExpanded = State(initialValue: initiallyExpanded)
     }
 
@@ -927,7 +1092,7 @@ private struct TopicRepliesCard: View {
                             .foregroundStyle(.tertiary)
                     }
                 }
-                MessageBodyView(message: reply)
+                MessageBodyView(message: reply, onOpenImage: onOpenImage)
             }
         }
         .padding(7)
