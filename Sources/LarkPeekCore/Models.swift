@@ -147,7 +147,29 @@ public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
 public enum MessageTimeline {
     public static func merging(_ older: [LarkMessage], into current: [LarkMessage]) -> [LarkMessage] {
         var byID = Dictionary(uniqueKeysWithValues: current.map { ($0.id, $0) })
-        for message in older { byID[message.id] = message }
+        for message in older {
+            guard let existing = byID[message.id] else {
+                byID[message.id] = message
+                continue
+            }
+
+            var merged = message
+            let existingImages = Dictionary(uniqueKeysWithValues: existing.images.map { ($0.key, $0) })
+            merged.images = message.images.map { image in
+                guard let hydrated = existingImages[image.key],
+                      hydrated.data != nil || hydrated.attempted else { return image }
+                return hydrated
+            }
+            if merged.sharedChatName == nil {
+                merged.sharedChatName = existing.sharedChatName
+            }
+            if existing.threadRepliesLoaded {
+                merged.threadReplies = existing.threadReplies
+                merged.threadRepliesLoaded = true
+                merged.threadHasMore = existing.threadHasMore
+            }
+            byID[message.id] = merged
+        }
         return byID.values.sorted(by: LarkMessage.isChronologicallyBefore)
     }
 }

@@ -37,6 +37,54 @@ import Testing
     #expect(MessageTimeline.merging(older, into: current).map(\.id) == ["om_1", "om_2", "om_3"])
 }
 
+@Test func messageTimelinePreservesHydratedStateForOverlappingPages() throws {
+    let sender = MessageSender(name: "A")
+    let imageData = Data([0x01, 0x02, 0x03])
+    let reply = LarkMessage(
+        id: "om_reply",
+        chatID: "oc_1",
+        createTime: Date(timeIntervalSince1970: 2),
+        sender: sender,
+        content: "reply",
+        images: [MessageImage(key: "img_reply", data: imageData, attempted: true)]
+    )
+    let current = LarkMessage(
+        id: "om_2",
+        chatID: "oc_1",
+        createTime: Date(timeIntervalSince1970: 2),
+        sender: sender,
+        content: "old content",
+        images: [MessageImage(key: "img_root", data: imageData, attempted: true)],
+        sharedChatID: "oc_shared",
+        sharedChatName: "已解析群名",
+        threadID: "omt_1",
+        threadReplies: [reply],
+        threadRepliesLoaded: true,
+        threadHasMore: true
+    )
+    let overlapping = LarkMessage(
+        id: "om_2",
+        chatID: "oc_1",
+        createTime: Date(timeIntervalSince1970: 2),
+        sender: sender,
+        content: "updated content",
+        images: [MessageImage(key: "img_root")],
+        sharedChatID: "oc_shared",
+        threadID: "omt_1",
+        updated: true
+    )
+
+    let merged = try #require(MessageTimeline.merging([overlapping], into: [current]).first)
+    #expect(merged.content == "updated content")
+    #expect(merged.updated)
+    #expect(merged.images.first?.data == imageData)
+    #expect(merged.images.first?.attempted == true)
+    #expect(merged.sharedChatName == "已解析群名")
+    #expect(merged.threadRepliesLoaded)
+    #expect(merged.threadHasMore)
+    #expect(merged.threadReplies.first?.images.first?.data == imageData)
+}
+
 @Test func rendersResourcePlaceholdersWithoutDownloading() throws {
     let json = #"{"ok":true,"data":{"messages":[{"message_id":"om_image","msg_type":"image","create_time":"1786400000000","sender":{"name":"A"},"content":"{\"image_key\":\"img_safe\"}"},{"message_id":"om_marker","msg_type":"text","create_time":"1786400000001","sender":{"name":"A"},"content":"[Image: img_v3_from_cli]"},{"message_id":"om_file","msg_type":"file","create_time":"1786400000002","sender":{"name":"A"},"content":"{\"file_name\":\"plan.pdf\"}"}]}}"#
     let messages = try LarkCLIParser.messages(from: Data(json.utf8), fallbackChatID: "oc_1")

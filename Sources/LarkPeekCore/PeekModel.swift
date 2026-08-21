@@ -35,8 +35,13 @@ public final class PeekModel: ObservableObject {
     private var recentChats: [LarkChat] = []
     private var nextPageToken: String?
     private var messageNextPageToken: String?
+    private var imageCache: [ImageRequest: Data] = [:]
+    private var imageCacheOrder: [ImageRequest] = []
+    private var imageCacheBytes = 0
     private let defaults: UserDefaults
     private let workingDirectory: URL
+
+    private static let maximumImageCacheBytes = 64 * 1_024 * 1_024
 
     public init(defaults: UserDefaults = .standard, workingDirectory: URL = FileManager.default.temporaryDirectory) {
         self.defaults = defaults
@@ -336,6 +341,7 @@ public final class PeekModel: ObservableObject {
         configureClient()
         recentChats = []
         nextPageToken = nil
+        removeAllCachedImages()
         await verifyAndPrewarm()
     }
 
@@ -710,23 +716,60 @@ public final class PeekModel: ObservableObject {
     }
 
     private func downloadImages(in messages: [LarkMessage], using client: LarkCLIClient) async -> [LarkMessage] {
-        let allMessages = messages + messages.flatMap(\.threadReplies)
+        let chatID = messages.first?.chatID
+        var hydratedMessages = applyingImageCache(to: messages)
+        if hydratedMessages != messages, let chatID {
+            publishImageProgress(hydratedMessages, forChatID: chatID)
+        }
+
+        // The timeline opens at the bottom, so prioritize the newest visible
+        // messages instead of making the initial viewport wait for old images.
+        let allMessages = hydratedMessages.reversed().flatMap { message in
+            [message] + message.threadReplies.reversed()
+        }
+        var seenRequests = Set<ImageRequest>()
         let requests = allMessages.flatMap { message in
-            message.images.compactMap { image in
-                image.data == nil && !image.attempted
-                    ? ImageRequest(messageID: message.id, key: image.key)
-                    : nil
+            message.images.compactMap { image -> ImageRequest? in
+                guard image.data == nil, !image.attempted else { return nil }
+                let request = ImageRequest(messageID: message.id, key: image.key)
+                return seenRequests.insert(request).inserted ? request : nil
             }
         }
-        guard !requests.isEmpty else { return messages }
+        guard !requests.isEmpty else { return hydratedMessages }
 
-        var downloaded: [ImageRequest: ImageDownload] = [:]
         let workingDirectory = self.workingDirectory
-        for start in stride(from: 0, to: requests.count, by: 3) {
-            if Task.isCancelled { return messages }
-            let batch = Array(requests[start..<min(start + 3, requests.count)])
-            let results = await withTaskGroup(of: (ImageRequest, ImageDownload).self) { group in
-                for request in batch {
+        await withTaskGroup(of: (ImageRequest, ImageDownload).self) { group in
+            var nextRequestIndex = 0
+
+            while nextRequestIndex < min(3, requests.count) {
+                let request = requests[nextRequestIndex]
+                nextRequestIndex += 1
+                group.addTask {
+                    let data = await Self.downloadImage(
+                        request,
+                        using: client,
+                        workingDirectory: workingDirectory
+                    )
+                    return (request, ImageDownload(data: data))
+                }
+            }
+
+            while let (request, download) = await group.next() {
+                guard !Task.isCancelled else {
+                    group.cancelAll()
+                    return
+                }
+                if let data = download.data {
+                    cacheImage(data, for: request)
+                }
+                hydratedMessages = applying([request: download], to: hydratedMessages)
+                if let chatID {
+                    publishImageProgress(hydratedMessages, forChatID: chatID)
+                }
+
+                if nextRequestIndex < requests.count {
+                    let request = requests[nextRequestIndex]
+                    nextRequestIndex += 1
                     group.addTask {
                         let data = await Self.downloadImage(
                             request,
@@ -736,19 +779,70 @@ public final class PeekModel: ObservableObject {
                         return (request, ImageDownload(data: data))
                     }
                 }
-                var values: [(ImageRequest, ImageDownload)] = []
-                for await value in group { values.append(value) }
-                return values
             }
-            for (request, download) in results { downloaded[request] = download }
         }
 
+        return hydratedMessages
+    }
+
+    private func applying(
+        _ downloaded: [ImageRequest: ImageDownload],
+        to messages: [LarkMessage]
+    ) -> [LarkMessage] {
         return messages.map { message in
             var message = message
             message = applying(downloaded, to: message)
             message.threadReplies = message.threadReplies.map { applying(downloaded, to: $0) }
             return message
         }
+    }
+
+    private func applyingImageCache(to messages: [LarkMessage]) -> [LarkMessage] {
+        messages.map { message in
+            var message = applyingImageCache(to: message)
+            message.threadReplies = message.threadReplies.map { applyingImageCache(to: $0) }
+            return message
+        }
+    }
+
+    private func applyingImageCache(to message: LarkMessage) -> LarkMessage {
+        var message = message
+        message.images = message.images.map { image in
+            guard image.data == nil,
+                  let data = imageCache[ImageRequest(messageID: message.id, key: image.key)]
+            else { return image }
+            return MessageImage(key: image.key, data: data, attempted: true)
+        }
+        return message
+    }
+
+    private func publishImageProgress(_ messages: [LarkMessage], forChatID chatID: String) {
+        guard case let .messages(conversation, chat, _, _) = state,
+              chat.id == chatID else { return }
+        state = .messages(conversation, chat, messages, Date())
+    }
+
+    private func cacheImage(_ data: Data, for request: ImageRequest) {
+        if let existing = imageCache.updateValue(data, forKey: request) {
+            imageCacheBytes -= existing.count
+            imageCacheOrder.removeAll { $0 == request }
+        }
+        imageCacheBytes += data.count
+        imageCacheOrder.append(request)
+
+        while imageCacheBytes > Self.maximumImageCacheBytes,
+              let oldest = imageCacheOrder.first {
+            imageCacheOrder.removeFirst()
+            if let removed = imageCache.removeValue(forKey: oldest) {
+                imageCacheBytes -= removed.count
+            }
+        }
+    }
+
+    private func removeAllCachedImages() {
+        imageCache.removeAll(keepingCapacity: false)
+        imageCacheOrder.removeAll(keepingCapacity: false)
+        imageCacheBytes = 0
     }
 
     private func applying(_ downloaded: [ImageRequest: ImageDownload], to message: LarkMessage) -> LarkMessage {
