@@ -531,12 +531,21 @@ private struct ImageLightboxView: View {
     @ObservedObject var presentation: ImagePreviewPresentation
     let onDismiss: () -> Void
 
+    private var geometryAnimation: Animation {
+        presentation.isExpanded
+            ? .spring(response: 0.3, dampingFraction: 0.86, blendDuration: 0.04)
+            : .timingCurve(0.4, 0, 0.8, 0.2, duration: 0.2)
+    }
+
     var body: some View {
         ZStack {
             Button(action: onDismiss) {
                 Color.black.opacity(presentation.isExpanded ? 0.82 : 0)
                     .contentShape(Rectangle())
-                    .animation(.easeOut(duration: 0.24), value: presentation.isExpanded)
+                    .animation(
+                        presentation.isExpanded ? .easeOut(duration: 0.18) : .easeIn(duration: 0.14),
+                        value: presentation.isExpanded
+                    )
             }
             .buttonStyle(.plain)
             .accessibilityLabel("关闭图片预览背景")
@@ -548,7 +557,7 @@ private struct ImageLightboxView: View {
                 .contentShape(Rectangle())
                 .onTapGesture { }
                 .padding(presentation.isExpanded ? 28 : 0)
-                .animation(.easeInOut(duration: 0.3), value: presentation.isExpanded)
+                .animation(geometryAnimation, value: presentation.isExpanded)
                 .accessibilityLabel("来自\(item.senderName)的图片")
                 .accessibilityIdentifier("peek-image-lightbox")
 
@@ -586,13 +595,18 @@ private struct ImageLightboxView: View {
             }
             .padding(14)
             .opacity(presentation.isExpanded ? 1 : 0)
-            .animation(.easeOut(duration: 0.18).delay(0.1), value: presentation.isExpanded)
+            .animation(
+                presentation.isExpanded
+                    ? .spring(response: 0.26, dampingFraction: 0.82).delay(0.06)
+                    : .easeOut(duration: 0.08),
+                value: presentation.isExpanded
+            )
         }
         .clipShape(RoundedRectangle(
             cornerRadius: presentation.isExpanded ? 16 : 9,
             style: .continuous
         ))
-        .animation(.easeInOut(duration: 0.3), value: presentation.isExpanded)
+        .animation(geometryAnimation, value: presentation.isExpanded)
     }
 }
 
@@ -605,7 +619,14 @@ private final class ImagePreviewPresentation: ObservableObject {
 private final class ImagePreviewPanelController {
     private static let maximumSize = CGSize(width: 1_200, height: 900)
     private static let screenFraction: CGFloat = 0.86
-    private static let animationDuration: TimeInterval = 0.3
+    private static let expansionDuration: TimeInterval = 0.28
+    private static let collapseDuration: TimeInterval = 0.2
+    private static let expansionTiming = CAMediaTimingFunction(
+        controlPoints: 0.16, 0.9, 0.22, 1
+    )
+    private static let collapseTiming = CAMediaTimingFunction(
+        controlPoints: 0.4, 0, 0.8, 0.2
+    )
 
     private let panel: PeekPanel
     private let presentation = ImagePreviewPresentation()
@@ -662,7 +683,11 @@ private final class ImagePreviewPanelController {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.panel.isVisible, !self.isDismissing else { return }
             self.presentation.isExpanded = true
-            self.animatePanel(to: destinationFrame)
+            self.animatePanel(
+                to: destinationFrame,
+                duration: Self.expansionDuration,
+                timingFunction: Self.expansionTiming
+            )
         }
     }
 
@@ -673,7 +698,11 @@ private final class ImagePreviewPanelController {
         animationGeneration += 1
         let generation = animationGeneration
         presentation.isExpanded = false
-        animatePanel(to: sourceFrame) { [weak self] in
+        animatePanel(
+            to: sourceFrame,
+            duration: Self.collapseDuration,
+            timingFunction: Self.collapseTiming
+        ) { [weak self] in
             guard let self, self.animationGeneration == generation else { return }
             self.panel.orderOut(nil)
             self.panel.contentView = nil
@@ -701,11 +730,13 @@ private final class ImagePreviewPanelController {
 
     private func animatePanel(
         to frame: CGRect,
+        duration: TimeInterval,
+        timingFunction: CAMediaTimingFunction,
         completion: (@MainActor @Sendable () -> Void)? = nil
     ) {
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = Self.animationDuration
-            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            context.duration = duration
+            context.timingFunction = timingFunction
             panel.animator().setFrame(frame, display: true)
         } completionHandler: {
             Task { @MainActor in completion?() }
