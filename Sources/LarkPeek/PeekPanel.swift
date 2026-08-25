@@ -1031,45 +1031,49 @@ private struct MessageBodyView: View {
     @ViewBuilder
     private func messageImage(_ image: MessageImage) -> some View {
         if let data = image.data, let decodedImage = NSImage(data: data) {
-            Button {
-                onOpenImage(PresentedImage(
-                    id: "\(message.id):\(image.key)",
-                    image: decodedImage,
-                    senderName: message.sender.name,
-                    sourceFrame: imageFrames[image.key] ?? .zero
-                ))
-            } label: {
-                Image(nsImage: decodedImage)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxWidth: 300, maxHeight: 240)
-                    .clipShape(RoundedRectangle(cornerRadius: 9))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 9)
-                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
-                    }
-                    .overlay(alignment: .bottomTrailing) {
-                        Image(systemName: "arrow.up.left.and.arrow.down.right")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .padding(6)
-                            .background(Color.black.opacity(0.58), in: Circle())
-                            .padding(7)
-                    }
-                    .background {
-                        ScreenFrameReader { frame in
-                            if imageFrames[image.key] != frame {
-                                imageFrames[image.key] = frame
-                            }
+            Image(nsImage: decodedImage)
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: 300, maxHeight: 240)
+                .clipShape(RoundedRectangle(cornerRadius: 9))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 9)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(6)
+                        .background(Color.black.opacity(0.58), in: Circle())
+                        .padding(7)
+                }
+                .background {
+                    ScreenFrameReader { frame in
+                        if imageFrames[image.key] != frame {
+                            imageFrames[image.key] = frame
                         }
                     }
-            }
-            .buttonStyle(.plain)
-            .contentShape(RoundedRectangle(cornerRadius: 9))
-            .help("点击查看大图")
-            .accessibilityLabel("打开来自\(message.sender.name)的图片预览")
-            .accessibilityHint("在浮窗中放大查看")
-            .accessibilityIdentifier("peek-image-thumbnail-\(image.key)")
+                }
+                .gesture(
+                    SpatialTapGesture().onEnded { value in
+                        openImage(
+                            decodedImage,
+                            key: image.key,
+                            localClickLocation: value.location
+                        )
+                    }
+                )
+                .contentShape(RoundedRectangle(cornerRadius: 9))
+                .help("点击查看大图")
+                .accessibilityElement(children: .ignore)
+                .accessibilityAddTraits(.isButton)
+                .accessibilityLabel("打开来自\(message.sender.name)的图片预览")
+                .accessibilityHint("在浮窗中放大查看")
+                .accessibilityIdentifier("peek-image-thumbnail-\(image.key)")
+                .accessibilityAction {
+                    openImage(decodedImage, key: image.key, localClickLocation: nil)
+                }
         } else if image.attempted {
             Label("图片暂不可用", systemImage: "photo.badge.exclamationmark")
                 .font(.system(size: 11))
@@ -1082,6 +1086,32 @@ private struct MessageBodyView: View {
             .font(.system(size: 11))
             .foregroundStyle(.secondary)
         }
+    }
+
+    private func openImage(
+        _ image: NSImage,
+        key: String,
+        localClickLocation: CGPoint?
+    ) {
+        let measuredFrame = imageFrames[key] ?? .zero
+        let sourceFrame: CGRect
+        if let localClickLocation, measuredFrame.width > 2, measuredFrame.height > 2 {
+            let click = NSEvent.mouseLocation
+            sourceFrame = CGRect(
+                x: click.x - localClickLocation.x,
+                y: click.y - (measuredFrame.height - localClickLocation.y),
+                width: measuredFrame.width,
+                height: measuredFrame.height
+            )
+        } else {
+            sourceFrame = measuredFrame
+        }
+        onOpenImage(PresentedImage(
+            id: "\(message.id):\(key)",
+            image: image,
+            senderName: message.sender.name,
+            sourceFrame: sourceFrame
+        ))
     }
 }
 
