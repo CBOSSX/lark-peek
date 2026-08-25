@@ -90,7 +90,8 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
             return event
         }
         let globalClicks = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            Task { @MainActor in self?.closeIfClickIsOutside() }
+            let clickLocation = NSEvent.mouseLocation
+            Task { @MainActor in self?.closeIfClickIsOutside(at: clickLocation) }
         }
         if let globalKeys { monitors.append(globalKeys) }
         if let localKeys { monitors.append(localKeys) }
@@ -102,6 +103,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
     private func handleKey(_ event: NSEvent) {
         guard !event.isARepeat else { return }
         if event.keyCode == 53, panelController.isVisible {
+            if panelController.dismissPresentedImage() { return }
             closePeek()
             return
         }
@@ -173,9 +175,9 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         panelController.close()
     }
 
-    private func closeIfClickIsOutside() {
+    private func closeIfClickIsOutside(at point: CGPoint) {
         guard panelController.isVisible else { return }
-        if !panelController.frame.contains(NSEvent.mouseLocation) { closePeek() }
+        if !panelController.contains(point) { closePeek() }
     }
 
     @objc private func requestAccessibility() {

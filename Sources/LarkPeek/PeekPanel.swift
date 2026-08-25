@@ -1,6 +1,7 @@
 import AppKit
 import LarkPeekCore
 import OSLog
+import QuartzCore
 import SwiftUI
 
 private let timelineLogger = Logger(subsystem: "io.github.cbossx.larkpeek", category: "MessageTimeline")
@@ -19,6 +20,60 @@ private final class CardHostingView: NSHostingView<PeekPanelView> {
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard interactiveRect.contains(point) else { return nil }
         return super.hitTest(point)
+    }
+}
+
+private struct PresentedImage: Identifiable {
+    let id: String
+    let image: NSImage
+    let senderName: String
+    let sourceFrame: CGRect
+}
+
+private struct ScreenFrameReader: NSViewRepresentable {
+    let onChange: (CGRect) -> Void
+
+    func makeNSView(context: Context) -> ScreenFrameReportingView {
+        let view = ScreenFrameReportingView()
+        view.onChange = onChange
+        return view
+    }
+
+    func updateNSView(_ nsView: ScreenFrameReportingView, context: Context) {
+        nsView.onChange = onChange
+        nsView.reportFrame()
+    }
+}
+
+private final class ScreenFrameReportingView: NSView {
+    var onChange: ((CGRect) -> Void)?
+    private var lastReportedFrame = CGRect.null
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        reportFrame()
+    }
+
+    override func layout() {
+        super.layout()
+        reportFrame()
+    }
+
+    func reportFrame() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let window = self.window else { return }
+            let rawFrame = window.convertToScreen(self.convert(self.bounds, to: nil))
+            let scale = window.backingScaleFactor
+            let frame = CGRect(
+                x: (rawFrame.minX * scale).rounded() / scale,
+                y: (rawFrame.minY * scale).rounded() / scale,
+                width: (rawFrame.width * scale).rounded() / scale,
+                height: (rawFrame.height * scale).rounded() / scale
+            )
+            guard !frame.equalTo(self.lastReportedFrame) else { return }
+            self.lastReportedFrame = frame
+            self.onChange?(frame)
+        }
     }
 }
 
@@ -44,6 +99,7 @@ final class PeekPanelController {
     private let model: PeekModel
     private let panel: PeekPanel
     private let presentation = PanelPresentation()
+    private lazy var imagePreviewController = ImagePreviewPanelController()
     private var closeTask: Task<Void, Never>?
 
     init(model: PeekModel) {
@@ -81,7 +137,8 @@ final class PeekPanelController {
             },
             onRetry: { [weak model] in
                 Task { @MainActor in await model?.retryCurrent() }
-            }
+            },
+            onOpenImage: { [weak self] item in self?.showPresentedImage(item) }
         ))
         // The window is resized manually (it stays enlarged to give the fly-in/out
         // animation room to render), so the hosting view must not clamp it to the
@@ -97,6 +154,7 @@ final class PeekPanelController {
     private var lastCardFrame: CGRect = .zero
 
     func show(anchor axFrame: CGRect) {
+        dismissPresentedImage()
         closeTask?.cancel()
         closeTask = nil
         let cardFrame = CGRect(origin: origin(for: axFrame, panelSize: Self.cardSize), size: Self.cardSize)
@@ -133,6 +191,7 @@ final class PeekPanelController {
     }
 
     func close() {
+        dismissPresentedImage()
         guard panel.isVisible, closeTask == nil else { return }
         // The window already covers the flight path, so the fly-out can start
         // immediately — no re-framing, no jump.
@@ -146,6 +205,20 @@ final class PeekPanelController {
             self.model.dismiss()
             self.closeTask = nil
         }
+    }
+
+    @discardableResult
+    func dismissPresentedImage() -> Bool {
+        imagePreviewController.dismiss()
+    }
+
+    func contains(_ point: CGPoint) -> Bool {
+        lastCardFrame.contains(point) || imagePreviewController.contains(point)
+    }
+
+    private func showPresentedImage(_ item: PresentedImage) {
+        let screen = NSScreen.screens.first(where: { $0.frame.intersects(lastCardFrame) }) ?? NSScreen.main
+        imagePreviewController.show(item, on: screen)
     }
 
     /// Restricts mouse interaction to the card; the transparent margin around it
@@ -226,6 +299,7 @@ private struct PeekPanelView: View {
     let onClose: () -> Void
     let onSelect: (LarkChat, HoveredConversation) -> Void
     let onRetry: () -> Void
+    let onOpenImage: (PresentedImage) -> Void
 
     private let cardShape = RoundedRectangle(cornerRadius: 16, style: .continuous)
 
@@ -353,7 +427,8 @@ private struct PeekPanelView: View {
             MessageTimelineView(
                 model: model,
                 messages: messages,
-                expandThreadsByDefault: conversation.threadHint != nil
+                expandThreadsByDefault: conversation.threadHint != nil,
+                onOpenImage: onOpenImage
             )
         case let .error(_, message):
             errorView(message)
@@ -451,10 +526,229 @@ private struct PeekPanelView: View {
 
 }
 
+private struct ImageLightboxView: View {
+    let item: PresentedImage
+    @ObservedObject var presentation: ImagePreviewPresentation
+    let onDismiss: () -> Void
+
+    private var geometryAnimation: Animation {
+        presentation.isExpanded
+            ? .spring(response: 0.3, dampingFraction: 0.86, blendDuration: 0.04)
+            : .timingCurve(0.4, 0, 0.8, 0.2, duration: 0.2)
+    }
+
+    var body: some View {
+        ZStack {
+            Button(action: onDismiss) {
+                Color.black.opacity(presentation.isExpanded ? 0.82 : 0)
+                    .contentShape(Rectangle())
+                    .animation(
+                        presentation.isExpanded ? .easeOut(duration: 0.18) : .easeIn(duration: 0.14),
+                        value: presentation.isExpanded
+                    )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("关闭图片预览背景")
+            .accessibilityIdentifier("peek-image-backdrop")
+
+            Image(nsImage: item.image)
+                .resizable()
+                .scaledToFit()
+                .contentShape(Rectangle())
+                .onTapGesture { }
+                .padding(presentation.isExpanded ? 28 : 0)
+                .animation(geometryAnimation, value: presentation.isExpanded)
+                .accessibilityLabel("来自\(item.senderName)的图片")
+                .accessibilityIdentifier("peek-image-lightbox")
+
+            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.white)
+                .padding(6)
+                .background(Color.black.opacity(0.58), in: Circle())
+                .padding(7)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                .opacity(presentation.isExpanded ? 0 : 1)
+                .animation(.easeOut(duration: 0.1), value: presentation.isExpanded)
+                .allowsHitTesting(false)
+
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                .opacity(presentation.isExpanded ? 0 : 1)
+                .allowsHitTesting(false)
+
+            VStack {
+                HStack {
+                    Spacer()
+                    Button(action: onDismiss) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 12, weight: .bold))
+                            .frame(width: 30, height: 30)
+                            .background(.ultraThinMaterial, in: Circle())
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("关闭图片预览")
+                    .accessibilityIdentifier("peek-image-close")
+                }
+                Spacer()
+            }
+            .padding(14)
+            .opacity(presentation.isExpanded ? 1 : 0)
+            .animation(
+                presentation.isExpanded
+                    ? .spring(response: 0.26, dampingFraction: 0.82).delay(0.06)
+                    : .easeOut(duration: 0.08),
+                value: presentation.isExpanded
+            )
+        }
+        .clipShape(RoundedRectangle(
+            cornerRadius: presentation.isExpanded ? 16 : 9,
+            style: .continuous
+        ))
+        .animation(geometryAnimation, value: presentation.isExpanded)
+    }
+}
+
+@MainActor
+private final class ImagePreviewPresentation: ObservableObject {
+    @Published var isExpanded = false
+}
+
+@MainActor
+private final class ImagePreviewPanelController {
+    private static let maximumSize = CGSize(width: 1_200, height: 900)
+    private static let screenFraction: CGFloat = 0.86
+    private static let expansionDuration: TimeInterval = 0.28
+    private static let collapseDuration: TimeInterval = 0.2
+    private static let expansionTiming = CAMediaTimingFunction(
+        controlPoints: 0.16, 0.9, 0.22, 1
+    )
+    private static let collapseTiming = CAMediaTimingFunction(
+        controlPoints: 0.4, 0, 0.8, 0.2
+    )
+
+    private let panel: PeekPanel
+    private let presentation = ImagePreviewPresentation()
+    private var sourceFrame = CGRect.zero
+    private var animationGeneration = 0
+    private var isDismissing = false
+
+    init() {
+        panel = PeekPanel(
+            contentRect: .zero,
+            styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.title = "图片预览"
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        panel.animationBehavior = .none
+        panel.becomesKeyOnlyIfNeeded = true
+    }
+
+    func show(_ item: PresentedImage, on screen: NSScreen?) {
+        animationGeneration += 1
+        isDismissing = false
+        presentation.isExpanded = false
+        let visible = screen?.visibleFrame ?? NSScreen.main?.visibleFrame
+            ?? CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let size = CGSize(
+            width: min(Self.maximumSize.width, visible.width * Self.screenFraction),
+            height: min(Self.maximumSize.height, visible.height * Self.screenFraction)
+        )
+        let destinationFrame = CGRect(
+            x: visible.midX - size.width / 2,
+            y: visible.midY - size.height / 2,
+            width: size.width,
+            height: size.height
+        )
+        sourceFrame = normalizedSourceFrame(item.sourceFrame, fallbackIn: destinationFrame)
+        let hostingView = NSHostingView(rootView: ImageLightboxView(
+            item: item,
+            presentation: presentation,
+            onDismiss: { [weak self] in self?.dismiss() }
+        ))
+        hostingView.sizingOptions = []
+        panel.contentView = hostingView
+        panel.setFrame(sourceFrame, display: true)
+        hostingView.layoutSubtreeIfNeeded()
+        panel.displayIfNeeded()
+        panel.orderFrontRegardless()
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.panel.isVisible, !self.isDismissing else { return }
+            self.presentation.isExpanded = true
+            self.animatePanel(
+                to: destinationFrame,
+                duration: Self.expansionDuration,
+                timingFunction: Self.expansionTiming
+            )
+        }
+    }
+
+    @discardableResult
+    func dismiss() -> Bool {
+        guard panel.isVisible, !isDismissing else { return false }
+        isDismissing = true
+        animationGeneration += 1
+        let generation = animationGeneration
+        presentation.isExpanded = false
+        animatePanel(
+            to: sourceFrame,
+            duration: Self.collapseDuration,
+            timingFunction: Self.collapseTiming
+        ) { [weak self] in
+            guard let self, self.animationGeneration == generation else { return }
+            self.panel.orderOut(nil)
+            self.panel.contentView = nil
+            self.isDismissing = false
+        }
+        return true
+    }
+
+    func contains(_ point: CGPoint) -> Bool {
+        panel.isVisible && panel.frame.contains(point)
+    }
+
+    private func normalizedSourceFrame(_ frame: CGRect, fallbackIn destination: CGRect) -> CGRect {
+        guard frame.width > 2, frame.height > 2 else {
+            let fallbackSize = CGSize(width: 96, height: 72)
+            return CGRect(
+                x: destination.midX - fallbackSize.width / 2,
+                y: destination.midY - fallbackSize.height / 2,
+                width: fallbackSize.width,
+                height: fallbackSize.height
+            )
+        }
+        return frame
+    }
+
+    private func animatePanel(
+        to frame: CGRect,
+        duration: TimeInterval,
+        timingFunction: CAMediaTimingFunction,
+        completion: (@MainActor @Sendable () -> Void)? = nil
+    ) {
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = duration
+            context.timingFunction = timingFunction
+            panel.animator().setFrame(frame, display: true)
+        } completionHandler: {
+            Task { @MainActor in completion?() }
+        }
+    }
+}
+
 private struct MessageTimelineView: View {
     @ObservedObject var model: PeekModel
     let messages: [LarkMessage]
     let expandThreadsByDefault: Bool
+    let onOpenImage: (PresentedImage) -> Void
 
     @State private var initializedChatID: String?
     @State private var loadTask: Task<Void, Never>?
@@ -611,7 +905,8 @@ private struct MessageTimelineView: View {
                 }
                 MessageContentView(
                     message: message,
-                    expandThreadByDefault: expandThreadsByDefault
+                    expandThreadByDefault: expandThreadsByDefault,
+                    onOpenImage: onOpenImage
                 )
             }
         }
@@ -635,14 +930,16 @@ private struct MessageTimelineView: View {
 private struct MessageContentView: View {
     let message: LarkMessage
     let expandThreadByDefault: Bool
+    let onOpenImage: (PresentedImage) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            MessageBodyView(message: message)
+            MessageBodyView(message: message, onOpenImage: onOpenImage)
             if message.threadID != nil {
                 TopicRepliesCard(
                     message: message,
-                    initiallyExpanded: expandThreadByDefault
+                    initiallyExpanded: expandThreadByDefault,
+                    onOpenImage: onOpenImage
                 )
             }
         }
@@ -652,6 +949,8 @@ private struct MessageContentView: View {
 
 private struct MessageBodyView: View {
     let message: LarkMessage
+    let onOpenImage: (PresentedImage) -> Void
+    @State private var imageFrames: [String: CGRect] = [:]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -731,8 +1030,8 @@ private struct MessageBodyView: View {
 
     @ViewBuilder
     private func messageImage(_ image: MessageImage) -> some View {
-        if let data = image.data, let image = NSImage(data: data) {
-            Image(nsImage: image)
+        if let data = image.data, let decodedImage = NSImage(data: data) {
+            Image(nsImage: decodedImage)
                 .resizable()
                 .scaledToFit()
                 .frame(maxWidth: 300, maxHeight: 240)
@@ -740,6 +1039,40 @@ private struct MessageBodyView: View {
                 .overlay {
                     RoundedRectangle(cornerRadius: 9)
                         .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(6)
+                        .background(Color.black.opacity(0.58), in: Circle())
+                        .padding(7)
+                }
+                .background {
+                    ScreenFrameReader { frame in
+                        if imageFrames[image.key] != frame {
+                            imageFrames[image.key] = frame
+                        }
+                    }
+                }
+                .gesture(
+                    SpatialTapGesture().onEnded { value in
+                        openImage(
+                            decodedImage,
+                            key: image.key,
+                            localClickLocation: value.location
+                        )
+                    }
+                )
+                .contentShape(RoundedRectangle(cornerRadius: 9))
+                .help("点击查看大图")
+                .accessibilityElement(children: .ignore)
+                .accessibilityAddTraits(.isButton)
+                .accessibilityLabel("打开来自\(message.sender.name)的图片预览")
+                .accessibilityHint("在浮窗中放大查看")
+                .accessibilityIdentifier("peek-image-thumbnail-\(image.key)")
+                .accessibilityAction {
+                    openImage(decodedImage, key: image.key, localClickLocation: nil)
                 }
         } else if image.attempted {
             Label("图片暂不可用", systemImage: "photo.badge.exclamationmark")
@@ -753,6 +1086,32 @@ private struct MessageBodyView: View {
             .font(.system(size: 11))
             .foregroundStyle(.secondary)
         }
+    }
+
+    private func openImage(
+        _ image: NSImage,
+        key: String,
+        localClickLocation: CGPoint?
+    ) {
+        let measuredFrame = imageFrames[key] ?? .zero
+        let sourceFrame: CGRect
+        if let localClickLocation, measuredFrame.width > 2, measuredFrame.height > 2 {
+            let click = NSEvent.mouseLocation
+            sourceFrame = CGRect(
+                x: click.x - localClickLocation.x,
+                y: click.y - (measuredFrame.height - localClickLocation.y),
+                width: measuredFrame.width,
+                height: measuredFrame.height
+            )
+        } else {
+            sourceFrame = measuredFrame
+        }
+        onOpenImage(PresentedImage(
+            id: "\(message.id):\(key)",
+            image: image,
+            senderName: message.sender.name,
+            sourceFrame: sourceFrame
+        ))
     }
 }
 
@@ -834,10 +1193,16 @@ private struct ForwardedMessagesCard: View {
 
 private struct TopicRepliesCard: View {
     let message: LarkMessage
+    let onOpenImage: (PresentedImage) -> Void
     @State private var isExpanded: Bool
 
-    init(message: LarkMessage, initiallyExpanded: Bool = false) {
+    init(
+        message: LarkMessage,
+        initiallyExpanded: Bool = false,
+        onOpenImage: @escaping (PresentedImage) -> Void
+    ) {
         self.message = message
+        self.onOpenImage = onOpenImage
         _isExpanded = State(initialValue: initiallyExpanded)
     }
 
@@ -927,7 +1292,7 @@ private struct TopicRepliesCard: View {
                             .foregroundStyle(.tertiary)
                     }
                 }
-                MessageBodyView(message: reply)
+                MessageBodyView(message: reply, onOpenImage: onOpenImage)
             }
         }
         .padding(7)

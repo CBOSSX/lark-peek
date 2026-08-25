@@ -300,6 +300,9 @@ public final class PeekModel: ObservableObject {
         )
         let chat = LarkChat(id: "oc_preview", name: "产品体验群", kind: .group)
         let now = Date()
+        let fixtureImageData = Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAGCAIAAABxZ0isAAAAK0lEQVR42mNQa/kPRDVWb4HojcdMIPo9yQaIGHBKYApBlOKWwBSCKMUpAQAyLlKZwbl2DQAAAABJRU5ErkJggg=="
+        )!
         let messages = [
             LarkMessage(id: "om_preview_1", chatID: chat.id, createTime: now.addingTimeInterval(-320), sender: MessageSender(name: "林澈"), content: "<p>新的 **Markdown** 预览已经可以体验了。</p><p>- 无序列表\n  - 嵌套列表\n> 引用内容</p>"),
             LarkMessage(id: "om_preview_2", chatID: chat.id, type: "interactive", createTime: now.addingTimeInterval(-180), sender: MessageSender(name: "周然"), content: "**体验提醒**\n鼠标停在飞书会话上，长按 ⌥，或按 ⌃⌥P 查看最近消息。"),
@@ -329,7 +332,21 @@ public final class PeekModel: ObservableObject {
                 ],
                 threadRepliesLoaded: true
             ),
-            LarkMessage(id: "om_preview_5", chatID: chat.id, type: "share_chat", createTime: now.addingTimeInterval(-45), sender: MessageSender(name: "Lark Peek"), content: "分享了一个群聊", sharedChatID: "oc_preview_shared", sharedChatName: "产品设计交流群")
+            LarkMessage(id: "om_preview_5", chatID: chat.id, type: "share_chat", createTime: now.addingTimeInterval(-45), sender: MessageSender(name: "Lark Peek"), content: "分享了一个群聊", sharedChatID: "oc_preview_shared", sharedChatName: "产品设计交流群"),
+            LarkMessage(
+                id: "om_preview_image",
+                chatID: chat.id,
+                createTime: now.addingTimeInterval(-15),
+                sender: MessageSender(name: "Lark Peek"),
+                content: "点击图片查看大图\n![Image](img_preview_fixture)",
+                images: [
+                    MessageImage(
+                        key: "img_preview_fixture",
+                        data: fixtureImageData,
+                        attempted: true
+                    )
+                ]
+            )
         ]
         state = .messages(conversation, chat, messages, now)
         statusMessage = "视觉预览模式"
