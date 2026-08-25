@@ -1,6 +1,7 @@
 import AppKit
 import LarkPeekCore
 import OSLog
+import QuartzCore
 import SwiftUI
 
 private let timelineLogger = Logger(subsystem: "io.github.cbossx.larkpeek", category: "MessageTimeline")
@@ -26,6 +27,54 @@ private struct PresentedImage: Identifiable {
     let id: String
     let image: NSImage
     let senderName: String
+    let sourceFrame: CGRect
+}
+
+private struct ScreenFrameReader: NSViewRepresentable {
+    let onChange: (CGRect) -> Void
+
+    func makeNSView(context: Context) -> ScreenFrameReportingView {
+        let view = ScreenFrameReportingView()
+        view.onChange = onChange
+        return view
+    }
+
+    func updateNSView(_ nsView: ScreenFrameReportingView, context: Context) {
+        nsView.onChange = onChange
+        nsView.reportFrame()
+    }
+}
+
+private final class ScreenFrameReportingView: NSView {
+    var onChange: ((CGRect) -> Void)?
+    private var lastReportedFrame = CGRect.null
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        reportFrame()
+    }
+
+    override func layout() {
+        super.layout()
+        reportFrame()
+    }
+
+    func reportFrame() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let window = self.window else { return }
+            let rawFrame = window.convertToScreen(self.convert(self.bounds, to: nil))
+            let scale = window.backingScaleFactor
+            let frame = CGRect(
+                x: (rawFrame.minX * scale).rounded() / scale,
+                y: (rawFrame.minY * scale).rounded() / scale,
+                width: (rawFrame.width * scale).rounded() / scale,
+                height: (rawFrame.height * scale).rounded() / scale
+            )
+            guard !frame.equalTo(self.lastReportedFrame) else { return }
+            self.lastReportedFrame = frame
+            self.onChange?(frame)
+        }
+    }
 }
 
 /// Drives the fly-in / fly-out presentation animation of the peek panel.
@@ -479,13 +528,15 @@ private struct PeekPanelView: View {
 
 private struct ImageLightboxView: View {
     let item: PresentedImage
+    @ObservedObject var presentation: ImagePreviewPresentation
     let onDismiss: () -> Void
 
     var body: some View {
         ZStack {
             Button(action: onDismiss) {
-                Color.black.opacity(0.82)
+                Color.black.opacity(presentation.isExpanded ? 0.82 : 0)
                     .contentShape(Rectangle())
+                    .animation(.easeOut(duration: 0.24), value: presentation.isExpanded)
             }
             .buttonStyle(.plain)
             .accessibilityLabel("关闭图片预览背景")
@@ -496,9 +547,26 @@ private struct ImageLightboxView: View {
                 .scaledToFit()
                 .contentShape(Rectangle())
                 .onTapGesture { }
-                .padding(28)
+                .padding(presentation.isExpanded ? 28 : 0)
+                .animation(.easeInOut(duration: 0.3), value: presentation.isExpanded)
                 .accessibilityLabel("来自\(item.senderName)的图片")
                 .accessibilityIdentifier("peek-image-lightbox")
+
+            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.white)
+                .padding(6)
+                .background(Color.black.opacity(0.58), in: Circle())
+                .padding(7)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                .opacity(presentation.isExpanded ? 0 : 1)
+                .animation(.easeOut(duration: 0.1), value: presentation.isExpanded)
+                .allowsHitTesting(false)
+
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                .opacity(presentation.isExpanded ? 0 : 1)
+                .allowsHitTesting(false)
 
             VStack {
                 HStack {
@@ -517,17 +585,33 @@ private struct ImageLightboxView: View {
                 Spacer()
             }
             .padding(14)
+            .opacity(presentation.isExpanded ? 1 : 0)
+            .animation(.easeOut(duration: 0.18).delay(0.1), value: presentation.isExpanded)
         }
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .clipShape(RoundedRectangle(
+            cornerRadius: presentation.isExpanded ? 16 : 9,
+            style: .continuous
+        ))
+        .animation(.easeInOut(duration: 0.3), value: presentation.isExpanded)
     }
+}
+
+@MainActor
+private final class ImagePreviewPresentation: ObservableObject {
+    @Published var isExpanded = false
 }
 
 @MainActor
 private final class ImagePreviewPanelController {
     private static let maximumSize = CGSize(width: 1_200, height: 900)
     private static let screenFraction: CGFloat = 0.86
+    private static let animationDuration: TimeInterval = 0.3
 
     private let panel: PeekPanel
+    private let presentation = ImagePreviewPresentation()
+    private var sourceFrame = CGRect.zero
+    private var animationGeneration = 0
+    private var isDismissing = false
 
     init() {
         panel = PeekPanel(
@@ -539,47 +623,93 @@ private final class ImagePreviewPanelController {
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = true
+        panel.hasShadow = false
         panel.title = "图片预览"
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
-        panel.animationBehavior = .utilityWindow
+        panel.animationBehavior = .none
         panel.becomesKeyOnlyIfNeeded = true
     }
 
     func show(_ item: PresentedImage, on screen: NSScreen?) {
+        animationGeneration += 1
+        isDismissing = false
+        presentation.isExpanded = false
         let visible = screen?.visibleFrame ?? NSScreen.main?.visibleFrame
             ?? CGRect(x: 0, y: 0, width: 1_440, height: 900)
         let size = CGSize(
             width: min(Self.maximumSize.width, visible.width * Self.screenFraction),
             height: min(Self.maximumSize.height, visible.height * Self.screenFraction)
         )
-        let frame = CGRect(
+        let destinationFrame = CGRect(
             x: visible.midX - size.width / 2,
             y: visible.midY - size.height / 2,
             width: size.width,
             height: size.height
         )
+        sourceFrame = normalizedSourceFrame(item.sourceFrame, fallbackIn: destinationFrame)
         let hostingView = NSHostingView(rootView: ImageLightboxView(
             item: item,
+            presentation: presentation,
             onDismiss: { [weak self] in self?.dismiss() }
         ))
         hostingView.sizingOptions = []
         panel.contentView = hostingView
-        panel.setFrame(frame, display: true)
+        panel.setFrame(sourceFrame, display: true)
+        hostingView.layoutSubtreeIfNeeded()
+        panel.displayIfNeeded()
         panel.orderFrontRegardless()
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.panel.isVisible, !self.isDismissing else { return }
+            self.presentation.isExpanded = true
+            self.animatePanel(to: destinationFrame)
+        }
     }
 
     @discardableResult
     func dismiss() -> Bool {
-        guard panel.isVisible else { return false }
-        panel.orderOut(nil)
-        panel.contentView = nil
+        guard panel.isVisible, !isDismissing else { return false }
+        isDismissing = true
+        animationGeneration += 1
+        let generation = animationGeneration
+        presentation.isExpanded = false
+        animatePanel(to: sourceFrame) { [weak self] in
+            guard let self, self.animationGeneration == generation else { return }
+            self.panel.orderOut(nil)
+            self.panel.contentView = nil
+            self.isDismissing = false
+        }
         return true
     }
 
     func contains(_ point: CGPoint) -> Bool {
         panel.isVisible && panel.frame.contains(point)
+    }
+
+    private func normalizedSourceFrame(_ frame: CGRect, fallbackIn destination: CGRect) -> CGRect {
+        guard frame.width > 2, frame.height > 2 else {
+            let fallbackSize = CGSize(width: 96, height: 72)
+            return CGRect(
+                x: destination.midX - fallbackSize.width / 2,
+                y: destination.midY - fallbackSize.height / 2,
+                width: fallbackSize.width,
+                height: fallbackSize.height
+            )
+        }
+        return frame
+    }
+
+    private func animatePanel(
+        to frame: CGRect,
+        completion: (@MainActor @Sendable () -> Void)? = nil
+    ) {
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = Self.animationDuration
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            panel.animator().setFrame(frame, display: true)
+        } completionHandler: {
+            Task { @MainActor in completion?() }
+        }
     }
 }
 
@@ -789,6 +919,7 @@ private struct MessageContentView: View {
 private struct MessageBodyView: View {
     let message: LarkMessage
     let onOpenImage: (PresentedImage) -> Void
+    @State private var imageFrames: [String: CGRect] = [:]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -873,7 +1004,8 @@ private struct MessageBodyView: View {
                 onOpenImage(PresentedImage(
                     id: "\(message.id):\(image.key)",
                     image: decodedImage,
-                    senderName: message.sender.name
+                    senderName: message.sender.name,
+                    sourceFrame: imageFrames[image.key] ?? .zero
                 ))
             } label: {
                 Image(nsImage: decodedImage)
@@ -892,6 +1024,13 @@ private struct MessageBodyView: View {
                             .padding(6)
                             .background(Color.black.opacity(0.58), in: Circle())
                             .padding(7)
+                    }
+                    .background {
+                        ScreenFrameReader { frame in
+                            if imageFrames[image.key] != frame {
+                                imageFrames[image.key] = frame
+                            }
+                        }
                     }
             }
             .buttonStyle(.plain)
