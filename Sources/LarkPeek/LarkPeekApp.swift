@@ -186,7 +186,37 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
     }
 
     @objc private func requestAccessibility() {
-        _ = hoverResolver.requestAccessibilityPermission()
+        NSApp.activate(ignoringOtherApps: true)
+
+        if hoverResolver.isAccessibilityTrusted {
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "辅助功能权限已开启"
+            alert.informativeText = "Lark Peek 已获准读取鼠标下方的飞书会话信息。"
+            alert.addButton(withTitle: "好")
+            alert.runModal()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "尚未开启辅助功能权限"
+        alert.informativeText = "请在“系统设置 → 隐私与安全性 → 辅助功能”中开启 Lark Peek。如果列表里已有旧副本，请移除后重新添加当前应用。"
+        alert.addButton(withTitle: "打开系统设置")
+        alert.addButton(withTitle: "稍后")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        guard let settingsURL = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        ), NSWorkspace.shared.open(settingsURL) else {
+            let failureAlert = NSAlert()
+            failureAlert.alertStyle = .warning
+            failureAlert.messageText = "无法自动打开系统设置"
+            failureAlert.informativeText = "请手动进入“系统设置 → 隐私与安全性 → 辅助功能”。"
+            failureAlert.addButton(withTitle: "好")
+            failureAlert.runModal()
+            return
+        }
     }
 
     @objc private func selectCLI() {
