@@ -59,6 +59,22 @@ Lark Peek 的读取链路没有调用标记已读接口，也不会为了预览�
 
 消息正文不会落盘；图片只按需下载到临时文件，读入内存后立即删除。同名会话的选择记录只保存匿名界面指纹与 `chat_id` 的本地映射。
 
+## 排查问题
+
+如果长按 `⌥ Option` 没有反应，先把鼠标停在会话名称或头像上，再按一次
+`⌃ Control + ⌥ Option + P` 获取明确的识别错误。菜单栏中的“检查辅助功能权限…”会显示当前权限状态，并可直接打开系统设置。
+
+复现问题后，可以在终端导出最近 10 分钟的诊断日志：
+
+```bash
+log show --last 10m --info --style compact \
+  --predicate 'subsystem == "io.github.cbossx.larkpeek"' \
+  > "$HOME/Desktop/LarkPeek-diagnostic.log"
+```
+
+日志使用一次性 `triggerID` 串联按键、辅助功能识别、浮窗展示和 `lark-cli` 请求。
+会话名、会话和消息标识均由系统隐私机制隐藏或哈希；不会记录消息正文、搜索词、访问令牌、完整命令参数或完整 CLI 输出。
+
 ## License
 
 [MIT](LICENSE)。Lark Peek 是独立开源项目，不代表 Lark、飞书或其关联公司的官方产品或背书。

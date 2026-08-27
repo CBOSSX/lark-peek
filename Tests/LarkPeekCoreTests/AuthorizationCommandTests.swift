@@ -23,6 +23,11 @@ import Testing
     }
 }
 
+@Test func authorizationDiagnosticNamesDoNotExposeScopesOrDeviceCodes() {
+    #expect(AuthorizationCommand.begin(scopes: ["im:chat:read"]).diagnosticName == "auth.login_begin")
+    #expect(AuthorizationCommand.complete(deviceCode: "private-device-code").diagnosticName == "auth.login_complete")
+}
+
 @Test func authStatusRequiresEveryLarkPeekScope() throws {
     let complete = #"{"verified":true,"identities":{"user":{"available":true,"verified":true,"scope":"im:chat:read im:message:readonly search:message offline_access"}}}"#
     let incomplete = #"{"verified":true,"identities":{"user":{"available":true,"verified":true,"scope":"im:chat:read im:message:readonly"}}}"#

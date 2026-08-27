@@ -97,3 +97,24 @@ import Testing
     #expect(description.contains("登录数据仍然保留"))
     #expect(!description.contains("重新登录"))
 }
+
+@Test func diagnosticCommandNamesNeverContainUserControlledValues() {
+    let sensitiveQuery = "内部项目名称"
+    let commands: [ReadOnlyCommand] = [
+        .authStatus,
+        .recentChats(pageToken: "private-page-token"),
+        .searchChats(query: sensitiveQuery),
+        .searchMessages(query: sensitiveQuery, chatIDs: ["oc_private"]),
+        .chatDetails(chatID: "oc_private"),
+        .recentMessages(chatID: "oc_private"),
+        .threadMessages(threadID: "omt_private"),
+        .messageImage(messageID: "om_private", fileKey: "img_private", outputPath: "private-file")
+    ]
+
+    #expect(Set(commands.map(\.diagnosticName)) == [
+        "auth.status", "im.chat_list", "im.chat_search", "im.message_search",
+        "im.chat_details", "im.recent_messages", "im.thread_messages", "im.image_download"
+    ])
+    #expect(commands.allSatisfy { !$0.diagnosticName.contains(sensitiveQuery) })
+    #expect(commands.allSatisfy { !$0.diagnosticName.contains("private") })
+}

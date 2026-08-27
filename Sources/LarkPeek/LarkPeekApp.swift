@@ -16,6 +16,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
     private var optionHoldTask: Task<Void, Never>?
     private var isOptionHeld = false
     private var isOptionPeekActive = false
+    private var activeTriggerID: String?
 
     static func main() {
         let application = NSApplication.shared
@@ -26,6 +27,9 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        LarkPeekDiagnostics.lifecycle.notice(
+            "event=app_launch version=\(self.appVersion, privacy: .public) build=\(self.appBuild, privacy: .public) os=\(ProcessInfo.processInfo.operatingSystemVersionString, privacy: .public) arch=\(self.architecture, privacy: .public) accessibility=\(self.hoverResolver.isAccessibilityTrusted)"
+        )
         installStatusItem()
         installEventMonitors()
         model.$statusMessage
@@ -44,6 +48,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        LarkPeekDiagnostics.lifecycle.notice("event=app_terminate")
         peekTask?.cancel()
         authorizationTask?.cancel()
         optionHoldTask?.cancel()
@@ -103,18 +108,21 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         if let globalModifiers { monitors.append(globalModifiers) }
         if let localModifiers { monitors.append(localModifiers) }
         if let globalClicks { monitors.append(globalClicks) }
+        LarkPeekDiagnostics.input.notice(
+            "event=monitors_installed globalKey=\(globalKeys != nil) localKey=\(localKeys != nil) globalModifiers=\(globalModifiers != nil) localModifiers=\(localModifiers != nil) globalClicks=\(globalClicks != nil) retained=\(self.monitors.count)"
+        )
     }
 
     private func handleKey(_ event: NSEvent) {
         guard !event.isARepeat else { return }
         if event.keyCode == 53, panelController.isVisible {
             if panelController.dismissPresentedImage() { return }
-            closePeek()
+            closePeek(reason: "escape")
             return
         }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         guard event.keyCode == 35, flags.contains([.control, .option]) else { return }
-        activatePeek(showResolutionErrors: true)
+        activatePeek(source: "control_option_p", showResolutionErrors: true)
     }
 
     private func handleModifierFlags(_ event: NSEvent) {
@@ -129,13 +137,16 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
             guard optionKeyCodes.contains(event.keyCode) else { return }
             guard !isOptionHeld else { return }
             isOptionHeld = true
+            LarkPeekDiagnostics.input.debug(
+                "event=option_hold_started keyCode=\(event.keyCode)"
+            )
             optionHoldTask?.cancel()
             optionHoldTask = Task { [weak self] in
                 try? await Task.sleep(for: .milliseconds(120))
                 guard !Task.isCancelled, let self, self.isOptionHeld else { return }
                 self.optionHoldTask = nil
                 self.isOptionPeekActive = true
-                self.activatePeek(showResolutionErrors: false)
+                self.activatePeek(source: "option_hold", showResolutionErrors: false)
             }
             return
         }
@@ -145,48 +156,71 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         optionHoldTask = nil
         if isOptionPeekActive {
             isOptionPeekActive = false
-            closePeek()
+            closePeek(reason: "option_release")
         }
     }
 
-    private func activatePeek(showResolutionErrors: Bool) {
+    private func activatePeek(source: String, showResolutionErrors: Bool) {
+        let triggerID = LarkPeekDiagnostics.makeTriggerID()
+        LarkPeekDiagnostics.input.notice(
+            "event=preview_trigger trigger=\(triggerID, privacy: .public) source=\(source, privacy: .public) showErrors=\(showResolutionErrors)"
+        )
         do {
-            let conversation = try hoverResolver.resolveCurrentConversation()
+            let conversation = try hoverResolver.resolveCurrentConversation(triggerID: triggerID)
             peekTask?.cancel()
-            panelController.show(anchor: conversation.rowFrame)
+            activeTriggerID = triggerID
+            panelController.show(anchor: conversation.rowFrame, triggerID: triggerID)
             peekTask = Task { [weak self] in
-                await self?.model.peek(conversation)
+                await LarkPeekDiagnostics.$triggerID.withValue(triggerID) {
+                    await self?.model.peek(conversation)
+                }
             }
         } catch HoverResolverError.accessibilityPermissionMissing {
+            LarkPeekDiagnostics.input.error(
+                "event=preview_aborted trigger=\(triggerID, privacy: .public) source=\(source, privacy: .public) code=permission_missing feedback=\(showResolutionErrors)"
+            )
             guard showResolutionErrors else { return }
             _ = hoverResolver.requestAccessibilityPermission()
             panelController.showError(
                 "需要辅助功能权限",
                 detail: "授权后不需要重启飞书。把鼠标停在会话行上，长按 ⌥，或按 ⌃⌥P。",
-                anchor: cursorAnchor()
+                anchor: cursorAnchor(),
+                triggerID: triggerID
             )
         } catch {
+            LarkPeekDiagnostics.input.error(
+                "event=preview_aborted trigger=\(triggerID, privacy: .public) source=\(source, privacy: .public) code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) feedback=\(showResolutionErrors)"
+            )
             guard showResolutionErrors else { return }
-            panelController.showError("无法识别会话", detail: error.localizedDescription, anchor: cursorAnchor())
+            panelController.showError(
+                "无法识别会话",
+                detail: error.localizedDescription,
+                anchor: cursorAnchor(),
+                triggerID: triggerID
+            )
         }
     }
 
-    private func closePeek() {
+    private func closePeek(reason: String) {
         optionHoldTask?.cancel()
         optionHoldTask = nil
         isOptionPeekActive = false
         peekTask?.cancel()
         // The controller dismisses the model after the fly-out animation finishes.
-        panelController.close()
+        panelController.close(triggerID: activeTriggerID, reason: reason)
+        activeTriggerID = nil
     }
 
     private func closeIfClickIsOutside(at point: CGPoint) {
         guard panelController.isVisible else { return }
-        if !panelController.contains(point) { closePeek() }
+        if !panelController.contains(point) { closePeek(reason: "outside_click") }
     }
 
     @objc private func requestAccessibility() {
         NSApp.activate(ignoringOtherApps: true)
+        LarkPeekDiagnostics.accessibility.notice(
+            "event=permission_menu_clicked trusted=\(self.hoverResolver.isAccessibilityTrusted)"
+        )
 
         if hoverResolver.isAccessibilityTrusted {
             let alert = NSAlert()
@@ -209,6 +243,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         guard let settingsURL = URL(
             string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
         ), NSWorkspace.shared.open(settingsURL) else {
+            LarkPeekDiagnostics.accessibility.error("event=settings_open_failed pane=accessibility")
             let failureAlert = NSAlert()
             failureAlert.alertStyle = .warning
             failureAlert.messageText = "无法自动打开系统设置"
@@ -217,6 +252,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
             failureAlert.runModal()
             return
         }
+        LarkPeekDiagnostics.accessibility.notice("event=settings_opened pane=accessibility")
     }
 
     @objc private func selectCLI() {
@@ -255,5 +291,23 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
     private func previewAnchor() -> CGRect {
         let primaryHeight = NSScreen.screens.first?.frame.height ?? 900
         return CGRect(x: 200, y: primaryHeight - 480, width: 420, height: 62)
+    }
+
+    private var appVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development"
+    }
+
+    private var appBuild: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "development"
+    }
+
+    private var architecture: String {
+        #if arch(arm64)
+        "arm64"
+        #elseif arch(x86_64)
+        "x86_64"
+        #else
+        "unknown"
+        #endif
     }
 }

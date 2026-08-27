@@ -42,6 +42,21 @@ public enum ReadOnlyCommand: Equatable, Sendable {
     /// Performs a server-side GET and writes only to an app-controlled temporary file.
     case messageImage(messageID: String, fileKey: String, outputPath: String)
 
+    /// Stable, non-sensitive operation name for diagnostics. Never derive this
+    /// from the argv array because it also contains chat IDs and search text.
+    public var diagnosticName: String {
+        switch self {
+        case .authStatus: "auth.status"
+        case .recentChats: "im.chat_list"
+        case .searchChats: "im.chat_search"
+        case .searchMessages: "im.message_search"
+        case .chatDetails: "im.chat_details"
+        case .recentMessages: "im.recent_messages"
+        case .threadMessages: "im.thread_messages"
+        case .messageImage: "im.image_download"
+        }
+    }
+
     public func arguments() throws -> [String] {
         switch self {
         case .authStatus:

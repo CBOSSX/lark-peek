@@ -1,12 +1,11 @@
 import Combine
 import CryptoKit
 import Foundation
-import OSLog
 
-private let peekModelLogger = Logger(subsystem: "io.github.cbossx.larkpeek", category: "Pagination")
-private let chatMatchLogger = Logger(subsystem: "io.github.cbossx.larkpeek", category: "ChatMatching")
-private let threadMatchLogger = Logger(subsystem: "io.github.cbossx.larkpeek", category: "ThreadMatching")
-private let hoverRouteLogger = Logger(subsystem: "io.github.cbossx.larkpeek", category: "HoverRouting")
+private let peekModelLogger = LarkPeekDiagnostics.pagination
+private let chatMatchLogger = LarkPeekDiagnostics.chatMatching
+private let threadMatchLogger = LarkPeekDiagnostics.threadMatching
+private let hoverRouteLogger = LarkPeekDiagnostics.hoverRouting
 
 private struct StoredThreadResolution: Codable {
     let threadID: String
@@ -30,6 +29,7 @@ public final class PeekModel: ObservableObject {
     @Published public private(set) var statusMessage = "正在准备只读预览…"
     @Published public private(set) var hasOlderMessages = false
     @Published public private(set) var isLoadingOlderMessages = false
+    @Published public private(set) var diagnosticTriggerID: String?
 
     private var client: LarkCLIClient?
     private var recentChats: [LarkChat] = []
@@ -63,6 +63,9 @@ public final class PeekModel: ObservableObject {
 
         authStatus.state = .checking
         statusMessage = "正在准备飞书最小权限授权…"
+        LarkPeekDiagnostics.lifecycle.notice(
+            "event=authorization_started missingScopes=\(missingScopes.count)"
+        )
         do {
             let result = try await client.run(.begin(scopes: missingScopes))
             let request = try LarkCLIParser.authorizationRequest(from: result.data)
@@ -74,12 +77,17 @@ public final class PeekModel: ObservableObject {
 
             statusMessage = "请在浏览器中确认飞书只读权限…"
             _ = try await client.run(.complete(deviceCode: request.deviceCode))
+            LarkPeekDiagnostics.lifecycle.notice("event=authorization_completed")
             statusMessage = "授权成功，正在验证权限…"
             await verifyAndPrewarm()
         } catch is CancellationError {
+            LarkPeekDiagnostics.lifecycle.info("event=authorization_cancelled")
             authStatus.state = .needsLogin
             statusMessage = "飞书授权已取消"
         } catch {
+            LarkPeekDiagnostics.lifecycle.error(
+                "event=authorization_failed code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)"
+            )
             // Keep the authorization action available after an expired device
             // code, a browser cancellation, or a transient network failure.
             authStatus.state = .needsLogin
@@ -88,8 +96,13 @@ public final class PeekModel: ObservableObject {
     }
 
     public func peek(_ conversation: HoveredConversation) async {
+        let trigger = LarkPeekDiagnostics.triggerID ?? "none"
+        diagnosticTriggerID = trigger
         resetMessagePagination()
         state = .loading(conversation)
+        hoverRouteLogger.info(
+            "event=peek_started trigger=\(trigger, privacy: .public) nodes=\(conversation.rowTexts.count)"
+        )
         do {
             let client = try requireClient()
             let hint = conversation.threadHint
@@ -99,7 +112,7 @@ public final class PeekModel: ObservableObject {
                 return "\(text.count):\(hasColon ? "c" : "-")\(hasClock ? "t" : "-")"
             }.joined(separator: ",")
             hoverRouteLogger.info(
-                "Resolved hover nodes=\(conversation.rowTexts.count) shape=\(rowShape, privacy: .public) threadHint=\(hint != nil) target=\(conversation.name, privacy: .private(mask: .hash))"
+                "event=route_classified trigger=\(trigger, privacy: .public) nodes=\(conversation.rowTexts.count) shape=\(rowShape, privacy: .public) threadHint=\(hint != nil) target=\(conversation.name, privacy: .private(mask: .hash))"
             )
 
             if let hint {
@@ -125,7 +138,7 @@ public final class PeekModel: ObservableObject {
                     } catch {
                         forgetThread(for: hint)
                         threadMatchLogger.info(
-                            "Discarded stale thread mapping key=\(hint.stableFingerprint, privacy: .private(mask: .hash)) error=\(error.localizedDescription, privacy: .private)"
+                            "event=stale_mapping_discarded trigger=\(trigger, privacy: .public) key=\(hint.stableFingerprint, privacy: .private(mask: .hash)) code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)"
                         )
                     }
                 }
@@ -145,7 +158,7 @@ public final class PeekModel: ObservableObject {
                     return
                 } catch {
                     threadMatchLogger.info(
-                        "Thread fast path unavailable query=\(hint.searchQuery, privacy: .private(mask: .hash)) error=\(error.localizedDescription, privacy: .private)"
+                        "event=fast_path_failed trigger=\(trigger, privacy: .public) query=\(hint.searchQuery, privacy: .private(mask: .hash)) code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)"
                     )
                     state = .error(conversation, "话题检索失败，请稍后重试。")
                     return
@@ -168,7 +181,7 @@ public final class PeekModel: ObservableObject {
 
             var matches = ChatMatcher.exactMatches(name: conversation.name, in: recentChats)
             chatMatchLogger.info(
-                "Checked cached chats target=\(conversation.name, privacy: .private(mask: .hash)) cachedCount=\(self.recentChats.count) exactCount=\(matches.count)"
+                "event=cached_lookup trigger=\(trigger, privacy: .public) target=\(conversation.name, privacy: .private(mask: .hash)) chats=\(self.recentChats.count) exact=\(matches.count)"
             )
             if matches.isEmpty {
                 // The activity-sorted first page is only a startup snapshot. A
@@ -176,13 +189,13 @@ public final class PeekModel: ObservableObject {
                 try await loadFirstChatPage(using: client)
                 matches = ChatMatcher.exactMatches(name: conversation.name, in: recentChats)
                 chatMatchLogger.info(
-                    "Refreshed recent chats target=\(conversation.name, privacy: .private(mask: .hash)) refreshedCount=\(self.recentChats.count) exactCount=\(matches.count)"
+                    "event=refreshed_lookup trigger=\(trigger, privacy: .public) target=\(conversation.name, privacy: .private(mask: .hash)) chats=\(self.recentChats.count) exact=\(matches.count)"
                 )
             }
             if matches.isEmpty {
                 matches = try await findExactByPagingRecentChats(name: conversation.name, using: client)
                 chatMatchLogger.info(
-                    "Finished exact paged lookup target=\(conversation.name, privacy: .private(mask: .hash)) indexedCount=\(self.recentChats.count) exactCount=\(matches.count)"
+                    "event=paged_lookup_completed trigger=\(trigger, privacy: .public) target=\(conversation.name, privacy: .private(mask: .hash)) chats=\(self.recentChats.count) exact=\(matches.count)"
                 )
             }
             if matches.isEmpty {
@@ -193,13 +206,13 @@ public final class PeekModel: ObservableObject {
                 mergeChats(searched)
                 matches = ChatMatcher.exactMatches(name: conversation.name, in: searched)
                 chatMatchLogger.info(
-                    "Checked group search target=\(conversation.name, privacy: .private(mask: .hash)) searchedCount=\(searched.count) exactCount=\(matches.count)"
+                    "event=group_search_completed trigger=\(trigger, privacy: .public) target=\(conversation.name, privacy: .private(mask: .hash)) searched=\(searched.count) exact=\(matches.count)"
                 )
             }
             if matches.isEmpty {
                 matches = ChatMatcher.fuzzyMatches(name: conversation.name, in: recentChats)
                 chatMatchLogger.info(
-                    "Falling back to fuzzy candidates target=\(conversation.name, privacy: .private(mask: .hash)) candidateCount=\(matches.count)"
+                    "event=fuzzy_fallback trigger=\(trigger, privacy: .public) target=\(conversation.name, privacy: .private(mask: .hash)) candidates=\(matches.count)"
                 )
             }
 
@@ -212,8 +225,14 @@ public final class PeekModel: ObservableObject {
                 state = .candidates(conversation, matches)
             }
         } catch is CancellationError {
+            hoverRouteLogger.info(
+                "event=peek_cancelled trigger=\(trigger, privacy: .public)"
+            )
             return
         } catch {
+            hoverRouteLogger.error(
+                "event=peek_failed trigger=\(trigger, privacy: .public) code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)"
+            )
             state = .error(conversation, error.localizedDescription)
         }
     }
@@ -244,6 +263,7 @@ public final class PeekModel: ObservableObject {
 
     public func dismiss() {
         resetMessagePagination()
+        diagnosticTriggerID = nil
         state = .waiting
     }
 
@@ -253,22 +273,29 @@ public final class PeekModel: ObservableObject {
     }
 
     public func loadOlderMessages() async {
+        let trigger = LarkPeekDiagnostics.triggerID ?? diagnosticTriggerID ?? "none"
         guard !isLoadingOlderMessages else {
-            peekModelLogger.debug("Ignoring older-message request: a page is already loading")
+            peekModelLogger.debug(
+                "event=older_page_ignored trigger=\(trigger, privacy: .public) reason=already_loading"
+            )
             return
         }
         guard let pageToken = messageNextPageToken else {
-            peekModelLogger.debug("Ignoring older-message request: no next-page token")
+            peekModelLogger.debug(
+                "event=older_page_ignored trigger=\(trigger, privacy: .public) reason=no_page_token"
+            )
             return
         }
         guard case let .messages(conversation, chat, currentMessages, _) = state else {
-            peekModelLogger.debug("Ignoring older-message request: timeline is not visible")
+            peekModelLogger.debug(
+                "event=older_page_ignored trigger=\(trigger, privacy: .public) reason=timeline_not_visible"
+            )
             return
         }
 
         let startedAt = Date()
         peekModelLogger.info(
-            "Loading older messages chat=\(chat.id, privacy: .private(mask: .hash)) token=\(pageToken, privacy: .private(mask: .hash)) currentCount=\(currentMessages.count)"
+            "event=older_page_started trigger=\(trigger, privacy: .public) chat=\(chat.id, privacy: .private(mask: .hash)) token=\(pageToken, privacy: .private(mask: .hash)) current=\(currentMessages.count)"
         )
         isLoadingOlderMessages = true
         defer { isLoadingOlderMessages = false }
@@ -281,13 +308,15 @@ public final class PeekModel: ObservableObject {
             try Task.checkCancellation()
             guard case let .messages(_, visibleChat, _, _) = state,
                   visibleChat.id == chat.id else {
-                peekModelLogger.debug("Discarding older-message page because the visible chat changed")
+                peekModelLogger.debug(
+                    "event=older_page_discarded trigger=\(trigger, privacy: .public) reason=chat_changed"
+                )
                 return
             }
 
             if page.nextPageToken == pageToken {
                 peekModelLogger.error(
-                    "Stopping pagination because the server repeated the same page token chat=\(chat.id, privacy: .private(mask: .hash))"
+                    "event=pagination_stopped trigger=\(trigger, privacy: .public) reason=repeated_token chat=\(chat.id, privacy: .private(mask: .hash))"
                 )
                 messageNextPageToken = nil
                 hasOlderMessages = false
@@ -310,22 +339,23 @@ public final class PeekModel: ObservableObject {
             state = .messages(conversation, chat, hydratedMessages, Date())
             let elapsedMilliseconds = Int(Date().timeIntervalSince(startedAt) * 1_000)
             peekModelLogger.info(
-                "Loaded older messages chat=\(chat.id, privacy: .private(mask: .hash)) pageCount=\(page.messages.count) mergedCount=\(mergedMessages.count) hasMore=\(page.nextPageToken != nil) elapsedMs=\(elapsedMilliseconds)"
+                "event=older_page_succeeded trigger=\(trigger, privacy: .public) chat=\(chat.id, privacy: .private(mask: .hash)) pageCount=\(page.messages.count) mergedCount=\(mergedMessages.count) hasMore=\(page.nextPageToken != nil) elapsedMs=\(elapsedMilliseconds)"
             )
         } catch is CancellationError {
             peekModelLogger.debug(
-                "Older-message request cancelled chat=\(chat.id, privacy: .private(mask: .hash))"
+                "event=older_page_cancelled trigger=\(trigger, privacy: .public) chat=\(chat.id, privacy: .private(mask: .hash))"
             )
             return
         } catch {
             peekModelLogger.error(
-                "Older-message request failed chat=\(chat.id, privacy: .private(mask: .hash)) error=\(error.localizedDescription, privacy: .private)"
+                "event=older_page_failed trigger=\(trigger, privacy: .public) chat=\(chat.id, privacy: .private(mask: .hash)) code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)"
             )
             statusMessage = "加载更早消息失败：\(error.localizedDescription)"
         }
     }
 
     public func showPreviewFixture() {
+        diagnosticTriggerID = "fixture"
         resetMessagePagination()
         let conversation = HoveredConversation(
             name: "产品体验群",
@@ -403,11 +433,17 @@ public final class PeekModel: ObservableObject {
             client = resolved
             cliPath = resolved.cliURL.path
             statusMessage = "只读预览已就绪"
+            LarkPeekDiagnostics.lifecycle.notice(
+                "event=cli_configured source=\(selected == nil ? "discovered" : "selected", privacy: .public) path=\(resolved.cliURL.path, privacy: .private(mask: .hash))"
+            )
         } catch {
             client = nil
             cliPath = nil
             authStatus = AuthStatus(state: .error(error.localizedDescription))
             statusMessage = error.localizedDescription
+            LarkPeekDiagnostics.lifecycle.error(
+                "event=cli_configuration_failed source=\(selected == nil ? "discovered" : "selected", privacy: .public) code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)"
+            )
         }
     }
 
@@ -415,11 +451,15 @@ public final class PeekModel: ObservableObject {
         guard let client else { return }
         authStatus = AuthStatus(state: .checking)
         statusMessage = "正在检查 lark-cli 登录状态…"
+        LarkPeekDiagnostics.lifecycle.info("event=prewarm_started")
         do {
             let auth = try await client.run(.authStatus)
             authStatus = try LarkCLIParser.authStatus(from: auth.data)
             guard authStatus.state == .ready else {
                 let count = authStatus.missingRequiredScopes.count
+                LarkPeekDiagnostics.lifecycle.notice(
+                    "event=auth_not_ready state=\(self.authStatus.state.diagnosticCode, privacy: .public) missingScopes=\(count)"
+                )
                 statusMessage = count == AuthStatus.requiredScopes.count
                     ? "需要授权飞书只读访问"
                     : "还缺少 \(count) 项飞书只读权限"
@@ -428,9 +468,15 @@ public final class PeekModel: ObservableObject {
             statusMessage = "正在缓存最近会话索引…"
             try await loadFirstChatPage(using: client)
             statusMessage = "只读预览已就绪 · 已索引最近 \(recentChats.count) 个会话"
+            LarkPeekDiagnostics.lifecycle.notice(
+                "event=prewarm_succeeded chats=\(self.recentChats.count)"
+            )
         } catch {
             authStatus = AuthStatus(state: .error(error.localizedDescription))
             statusMessage = error.localizedDescription
+            LarkPeekDiagnostics.lifecycle.error(
+                "event=prewarm_failed code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)"
+            )
         }
     }
 
@@ -496,7 +542,7 @@ public final class PeekModel: ObservableObject {
               visibleChat.id == chat.id else { return }
         state = .messages(conversation, chat, hydratedMessages, Date())
         peekModelLogger.info(
-            "Loaded initial messages chat=\(chat.id, privacy: .private(mask: .hash)) count=\(messages.count) hasMore=\(page.nextPageToken != nil)"
+            "event=initial_messages_succeeded trigger=\(LarkPeekDiagnostics.triggerID ?? "none", privacy: .public) chat=\(chat.id, privacy: .private(mask: .hash)) count=\(messages.count) hasMore=\(page.nextPageToken != nil)"
         )
     }
 
@@ -504,18 +550,19 @@ public final class PeekModel: ObservableObject {
         for hint: ThreadRowHint,
         using client: LarkCLIClient
     ) async throws -> ThreadSearchHit? {
+        let trigger = LarkPeekDiagnostics.triggerID ?? diagnosticTriggerID ?? "none"
         try Task.checkCancellation()
         if hint.searchQuery.count >= 6 {
             let result = try await client.run(.searchMessages(query: hint.searchQuery, pageSize: 10))
             let hits = try LarkCLIParser.threadSearchHits(from: result.data)
             if let matched = ThreadSearchMatcher.bestHit(for: hint, in: hits) {
                 threadMatchLogger.info(
-                    "Matched thread by root query=\(hint.searchQuery, privacy: .private(mask: .hash)) hitCount=\(hits.count)"
+                    "event=root_query_matched trigger=\(trigger, privacy: .public) query=\(hint.searchQuery, privacy: .private(mask: .hash)) hits=\(hits.count)"
                 )
                 return usingKnownChat(for: matched)
             }
             threadMatchLogger.info(
-                "Root thread search inconclusive query=\(hint.searchQuery, privacy: .private(mask: .hash)) hitCount=\(hits.count)"
+                "event=root_query_inconclusive trigger=\(trigger, privacy: .public) query=\(hint.searchQuery, privacy: .private(mask: .hash)) hits=\(hits.count)"
             )
         }
 
@@ -530,7 +577,7 @@ public final class PeekModel: ObservableObject {
         let replyHits = try LarkCLIParser.threadSearchHits(from: replyResult.data)
         let replyCandidates = matchingReplyHits(for: hint, in: replyHits)
         threadMatchLogger.info(
-            "Checked thread reply fallback query=\(replyQuery, privacy: .private(mask: .hash)) hitCount=\(replyHits.count) candidates=\(replyCandidates.count)"
+            "event=reply_fallback_checked trigger=\(trigger, privacy: .public) query=\(replyQuery, privacy: .private(mask: .hash)) hits=\(replyHits.count) candidates=\(replyCandidates.count)"
         )
         if replyCandidates.count == 1, let replyHit = replyCandidates.first {
             return syntheticRootHit(for: hint, from: replyHit, createTime: bounds.date)
@@ -552,11 +599,13 @@ public final class PeekModel: ObservableObject {
         }
         guard exactRoots.count == 1, let matched = exactRoots.first else {
             threadMatchLogger.info(
-                "Short-root lookup remained ambiguous chats=\(candidateChatIDs.count) hits=\(narrowedHits.count) exact=\(exactRoots.count)"
+                "event=short_root_ambiguous trigger=\(trigger, privacy: .public) chats=\(candidateChatIDs.count) hits=\(narrowedHits.count) exact=\(exactRoots.count)"
             )
             return nil
         }
-        threadMatchLogger.info("Matched short thread root after reply narrowing chats=\(candidateChatIDs.count)")
+        threadMatchLogger.info(
+            "event=short_root_matched trigger=\(trigger, privacy: .public) chats=\(candidateChatIDs.count)"
+        )
         return usingKnownChat(for: matched)
     }
 
@@ -643,6 +692,7 @@ public final class PeekModel: ObservableObject {
         conversation: HoveredConversation,
         using client: LarkCLIClient
     ) async throws {
+        let trigger = LarkPeekDiagnostics.triggerID ?? diagnosticTriggerID ?? "none"
         guard let threadID = root.threadID else { throw LarkCLIError.malformedResponse }
         resetMessagePagination()
         var root = root
@@ -663,7 +713,7 @@ public final class PeekModel: ObservableObject {
               visibleChat.id == chat.id else { return }
         state = .messages(conversation, chat, hydrated, Date())
         threadMatchLogger.info(
-            "Loaded standalone thread chat=\(chat.id, privacy: .private(mask: .hash)) replies=\(root.threadReplies.count) hasMore=\(page.nextPageToken != nil)"
+            "event=thread_loaded trigger=\(trigger, privacy: .public) chat=\(chat.id, privacy: .private(mask: .hash)) replies=\(root.threadReplies.count) hasMore=\(page.nextPageToken != nil)"
         )
     }
 
@@ -938,7 +988,7 @@ public final class PeekModel: ObservableObject {
             return try Data(contentsOf: fileURL)
         } catch {
             peekModelLogger.debug(
-                "Image download unavailable message=\(request.messageID, privacy: .private(mask: .hash)) key=\(request.key, privacy: .private(mask: .hash)) error=\(error.localizedDescription, privacy: .private)"
+                "event=image_download_unavailable trigger=\(LarkPeekDiagnostics.triggerID ?? "none", privacy: .public) message=\(request.messageID, privacy: .private(mask: .hash)) key=\(request.key, privacy: .private(mask: .hash)) code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)"
             )
             return nil
         }

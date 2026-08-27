@@ -1,10 +1,9 @@
 import AppKit
 import LarkPeekCore
-import OSLog
 import QuartzCore
 import SwiftUI
 
-private let timelineLogger = Logger(subsystem: "io.github.cbossx.larkpeek", category: "MessageTimeline")
+private let timelineLogger = LarkPeekDiagnostics.messageTimeline
 
 private final class PeekPanel: NSPanel {
     override var canBecomeKey: Bool { true }
@@ -152,11 +151,13 @@ final class PeekPanelController {
     var frame: CGRect { lastCardFrame }
 
     private var lastCardFrame: CGRect = .zero
+    private var lastTriggerID: String?
 
-    func show(anchor axFrame: CGRect) {
+    func show(anchor axFrame: CGRect, triggerID: String) {
         dismissPresentedImage()
         closeTask?.cancel()
         closeTask = nil
+        lastTriggerID = triggerID
         let cardFrame = CGRect(origin: origin(for: axFrame, panelSize: Self.cardSize), size: Self.cardSize)
         lastCardFrame = cardFrame
         let anchor = cursorPoint(NSEvent.mouseLocation, relativeTo: cardFrame)
@@ -168,31 +169,55 @@ final class PeekPanelController {
         panel.setFrame(flight, display: false)
         presentation.cardOffset = cardOffset(of: cardFrame, within: flight)
         updateInteractiveRect()
+        LarkPeekDiagnostics.panel.info(
+            "event=show_requested trigger=\(triggerID, privacy: .public) alreadyVisible=\(self.panel.isVisible) cardWidth=\(cardFrame.width, format: .fixed(precision: 0)) cardHeight=\(cardFrame.height, format: .fixed(precision: 0)) flightWidth=\(flight.width, format: .fixed(precision: 0)) flightHeight=\(flight.height, format: .fixed(precision: 0))"
+        )
         if panel.isVisible {
             presentation.isPresented = true
+            LarkPeekDiagnostics.panel.notice(
+                "event=show_completed trigger=\(triggerID, privacy: .public) visible=\(self.panel.isVisible) reused=true"
+            )
             return
         }
         panel.orderFrontRegardless()
+        LarkPeekDiagnostics.panel.notice(
+            "event=window_ordered_front trigger=\(triggerID, privacy: .public) visible=\(self.panel.isVisible)"
+        )
         // Let the hidden state render for one pass so the fly-in animation plays.
         DispatchQueue.main.async { [presentation] in
             presentation.isPresented = true
+            LarkPeekDiagnostics.panel.notice(
+                "event=show_completed trigger=\(triggerID, privacy: .public) visible=\(self.panel.isVisible) reused=false"
+            )
         }
     }
 
     func showPreviewFixture(anchor: CGRect) {
         model.showPreviewFixture()
         installContentView()
-        show(anchor: anchor)
+        show(anchor: anchor, triggerID: "fixture")
     }
 
-    func showError(_ title: String, detail: String, anchor: CGRect) {
+    func showError(_ title: String, detail: String, anchor: CGRect, triggerID: String) {
+        LarkPeekDiagnostics.panel.error(
+            "event=show_error trigger=\(triggerID, privacy: .public) title=\(title, privacy: .private)"
+        )
         model.presentError("\(title)：\(detail)")
-        show(anchor: anchor)
+        show(anchor: anchor, triggerID: triggerID)
     }
 
-    func close() {
+    func close(triggerID: String? = nil, reason: String = "panel_control") {
         dismissPresentedImage()
-        guard panel.isVisible, closeTask == nil else { return }
+        let trigger = triggerID ?? lastTriggerID ?? "none"
+        guard panel.isVisible, closeTask == nil else {
+            LarkPeekDiagnostics.panel.debug(
+                "event=close_ignored trigger=\(trigger, privacy: .public) reason=\(reason, privacy: .public) visible=\(self.panel.isVisible) closePending=\(self.closeTask != nil)"
+            )
+            return
+        }
+        LarkPeekDiagnostics.panel.info(
+            "event=close_requested trigger=\(trigger, privacy: .public) reason=\(reason, privacy: .public)"
+        )
         // The window already covers the flight path, so the fly-out can start
         // immediately — no re-framing, no jump.
         presentation.isPresented = false
@@ -204,6 +229,10 @@ final class PeekPanelController {
             self.presentation.cardOffset = .zero
             self.model.dismiss()
             self.closeTask = nil
+            self.lastTriggerID = nil
+            LarkPeekDiagnostics.panel.notice(
+                "event=close_completed trigger=\(trigger, privacy: .public) visible=\(self.panel.isVisible)"
+            )
         }
     }
 
@@ -781,7 +810,7 @@ private struct MessageTimelineView: View {
                                     guard message.id == messages.first?.id
                                             || message.id == messages.last?.id else { return }
                                     timelineLogger.info(
-                                        "Timeline boundary row appeared chat=\(chatID ?? "none", privacy: .private(mask: .hash)) message=\(message.id, privacy: .private(mask: .hash)) count=\(messages.count)"
+                                        "event=boundary_appeared trigger=\(model.diagnosticTriggerID ?? "none", privacy: .public) chat=\(chatID ?? "none", privacy: .private(mask: .hash)) message=\(message.id, privacy: .private(mask: .hash)) count=\(messages.count)"
                                     )
                                 }
                         }
@@ -792,7 +821,7 @@ private struct MessageTimelineView: View {
                     ScrollTopObserver {
                         guard initializedChatID == chatID else { return }
                         timelineLogger.debug(
-                            "Reached timeline top chat=\(chatID ?? "none", privacy: .private(mask: .hash)) count=\(messages.count)"
+                            "event=top_reached trigger=\(model.diagnosticTriggerID ?? "none", privacy: .public) chat=\(chatID ?? "none", privacy: .private(mask: .hash)) count=\(messages.count)"
                         )
                         loadOlderMessages(using: proxy)
                     }
@@ -808,13 +837,13 @@ private struct MessageTimelineView: View {
                 guard !Task.isCancelled else { return }
                 initializedChatID = chatID
                 timelineLogger.info(
-                    "Timeline initialized with eager bottom layout chat=\(chatID ?? "none", privacy: .private(mask: .hash)) count=\(messages.count)"
+                    "event=initialized trigger=\(model.diagnosticTriggerID ?? "none", privacy: .public) chat=\(chatID ?? "none", privacy: .private(mask: .hash)) count=\(messages.count) anchor=bottom"
                 )
             }
             .onDisappear {
                 if loadTask != nil {
                     timelineLogger.debug(
-                        "Cancelling older-message UI task chat=\(chatID ?? "none", privacy: .private(mask: .hash))"
+                        "event=older_page_ui_cancelled trigger=\(model.diagnosticTriggerID ?? "none", privacy: .public) chat=\(chatID ?? "none", privacy: .private(mask: .hash)) reason=disappeared"
                     )
                 }
                 loadTask?.cancel()
@@ -831,7 +860,7 @@ private struct MessageTimelineView: View {
             } else {
                 Button("加载更早消息") {
                     timelineLogger.debug(
-                        "Manual older-message request chat=\(chatID ?? "none", privacy: .private(mask: .hash)) count=\(messages.count)"
+                        "event=older_page_ui_requested trigger=\(model.diagnosticTriggerID ?? "none", privacy: .public) chat=\(chatID ?? "none", privacy: .private(mask: .hash)) count=\(messages.count) source=button"
                     )
                     loadOlderMessages(using: proxy)
                 }
@@ -846,25 +875,33 @@ private struct MessageTimelineView: View {
 
     private func loadOlderMessages(using proxy: ScrollViewProxy) {
         guard loadTask == nil else {
-            timelineLogger.debug("Ignoring duplicate older-message UI request: task already active")
+            timelineLogger.debug(
+                "event=older_page_ui_ignored trigger=\(model.diagnosticTriggerID ?? "none", privacy: .public) reason=task_active"
+            )
             return
         }
         guard model.hasOlderMessages, !model.isLoadingOlderMessages else {
-            timelineLogger.debug("Ignoring older-message UI request: no page available or model already loading")
+            timelineLogger.debug(
+                "event=older_page_ui_ignored trigger=\(model.diagnosticTriggerID ?? "none", privacy: .public) reason=unavailable"
+            )
             return
         }
         guard let anchorID = messages.first?.id else {
-            timelineLogger.debug("Ignoring older-message UI request: timeline is empty")
+            timelineLogger.debug(
+                "event=older_page_ui_ignored trigger=\(model.diagnosticTriggerID ?? "none", privacy: .public) reason=empty_timeline"
+            )
             return
         }
         let previousCount = messages.count
         timelineLogger.info(
-            "Preserving timeline position while loading older messages chat=\(chatID ?? "none", privacy: .private(mask: .hash)) anchor=\(anchorID, privacy: .private(mask: .hash)) count=\(previousCount)"
+            "event=position_preservation_started trigger=\(model.diagnosticTriggerID ?? "none", privacy: .public) chat=\(chatID ?? "none", privacy: .private(mask: .hash)) anchor=\(anchorID, privacy: .private(mask: .hash)) count=\(previousCount)"
         )
         loadTask = Task { @MainActor in
             await model.loadOlderMessages()
             guard !Task.isCancelled else {
-                timelineLogger.info("Timeline position preservation cancelled")
+                timelineLogger.info(
+                    "event=position_preservation_cancelled trigger=\(model.diagnosticTriggerID ?? "none", privacy: .public)"
+                )
                 loadTask = nil
                 return
             }
@@ -881,7 +918,7 @@ private struct MessageTimelineView: View {
                 currentCount = previousCount
             }
             timelineLogger.info(
-                "Preserved timeline position after loading older messages anchor=\(anchorID, privacy: .private(mask: .hash)) previousCount=\(previousCount) currentCount=\(currentCount)"
+                "event=position_preservation_completed trigger=\(model.diagnosticTriggerID ?? "none", privacy: .public) anchor=\(anchorID, privacy: .private(mask: .hash)) previousCount=\(previousCount) currentCount=\(currentCount)"
             )
             loadTask = nil
         }
@@ -1479,14 +1516,14 @@ private final class ScrollTopObserverView: NSView {
         guard let previouslyNearTop = wasNearTop else {
             wasNearTop = isNearTop
             timelineLogger.debug(
-                "Top observer initialized distance=\(distanceFromTop, format: .fixed(precision: 1)) nearTop=\(isNearTop)"
+                "event=top_observer_initialized distance=\(distanceFromTop, format: .fixed(precision: 1)) nearTop=\(isNearTop)"
             )
             return
         }
         wasNearTop = isNearTop
         if !previouslyNearTop, isNearTop {
             timelineLogger.debug(
-                "Top observer crossed threshold distance=\(distanceFromTop, format: .fixed(precision: 1))"
+                "event=top_threshold_crossed distance=\(distanceFromTop, format: .fixed(precision: 1))"
             )
             onReachedTop?()
         }

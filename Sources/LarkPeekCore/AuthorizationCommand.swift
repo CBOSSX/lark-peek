@@ -20,6 +20,13 @@ public enum AuthorizationCommand: Equatable, Sendable {
     case begin(scopes: Set<String>)
     case complete(deviceCode: String)
 
+    public var diagnosticName: String {
+        switch self {
+        case .begin: "auth.login_begin"
+        case .complete: "auth.login_complete"
+        }
+    }
+
     public func arguments() throws -> [String] {
         switch self {
         case let .begin(scopes):

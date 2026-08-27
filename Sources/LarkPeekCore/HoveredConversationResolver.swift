@@ -8,6 +8,16 @@ public enum HoverResolverError: LocalizedError, Equatable {
     case conversationRowNotFound
     case conversationNameNotFound
 
+    public var diagnosticCode: String {
+        switch self {
+        case .accessibilityPermissionMissing: "permission_missing"
+        case .larkNotRunning: "lark_not_running"
+        case .pointerNotOverLark: "pointer_not_over_lark"
+        case .conversationRowNotFound: "conversation_row_not_found"
+        case .conversationNameNotFound: "conversation_name_not_found"
+        }
+    }
+
     public var errorDescription: String? {
         switch self {
         case .accessibilityPermissionMissing:
@@ -65,33 +75,50 @@ public final class HoveredConversationResolver {
 
     @discardableResult
     public func requestAccessibilityPermission() -> Bool {
+        let before = isAccessibilityTrusted
         // Avoid importing the mutable C global into Swift 6 concurrency checking.
         // This is the documented string value of kAXTrustedCheckOptionPrompt.
         let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
-        return AXIsProcessTrustedWithOptions(options)
+        let current = AXIsProcessTrustedWithOptions(options)
+        LarkPeekDiagnostics.accessibility.notice(
+            "event=permission_request before=\(before) current=\(current)"
+        )
+        return current
     }
 
-    public func resolveCurrentConversation() throws -> HoveredConversation {
-        guard isAccessibilityTrusted else { throw HoverResolverError.accessibilityPermissionMissing }
+    public func resolveCurrentConversation(triggerID: String? = nil) throws -> HoveredConversation {
+        let trigger = triggerID ?? LarkPeekDiagnostics.triggerID ?? "none"
+        LarkPeekDiagnostics.accessibility.info(
+            "event=resolve_started trigger=\(trigger, privacy: .public) trusted=\(self.isAccessibilityTrusted)"
+        )
+        guard isAccessibilityTrusted else {
+            throw loggedFailure(.accessibilityPermissionMissing, trigger: trigger, stage: "permission")
+        }
         guard NSWorkspace.shared.runningApplications.contains(where: { app in
             LarkApplicationIdentity.matches(bundleIdentifier: app.bundleIdentifier)
-        }) else { throw HoverResolverError.larkNotRunning }
-        guard let point = CGEvent(source: nil)?.location else { throw HoverResolverError.pointerNotOverLark }
+        }) else {
+            throw loggedFailure(.larkNotRunning, trigger: trigger, stage: "lark_process")
+        }
+        guard let point = CGEvent(source: nil)?.location else {
+            throw loggedFailure(.pointerNotOverLark, trigger: trigger, stage: "pointer")
+        }
 
         let systemWide = AXUIElementCreateSystemWide()
         var hit: AXUIElement?
         guard AXUIElementCopyElementAtPosition(systemWide, Float(point.x), Float(point.y), &hit) == .success,
-              let hit else { throw HoverResolverError.pointerNotOverLark }
+              let hit else {
+            throw loggedFailure(.pointerNotOverLark, trigger: trigger, stage: "hit_test")
+        }
 
         var pid: pid_t = 0
         guard AXUIElementGetPid(hit, &pid) == .success,
               let app = NSRunningApplication(processIdentifier: pid),
               LarkApplicationIdentity.matches(bundleIdentifier: app.bundleIdentifier) else {
-            throw HoverResolverError.pointerNotOverLark
+            throw loggedFailure(.pointerNotOverLark, trigger: trigger, stage: "process_identity")
         }
 
         guard let row = bestConversationRow(startingAt: hit), let frame = frame(of: row) else {
-            throw HoverResolverError.conversationRowNotFound
+            throw loggedFailure(.conversationRowNotFound, trigger: trigger, stage: "row_lookup")
         }
         let records = textRecords(in: row)
         let topLineLimit = frame.minY + frame.height * 0.58
@@ -104,8 +131,27 @@ public final class HoveredConversationResolver {
         let allTexts = records.map(\.text)
         guard let name = ConversationNameHeuristics.chooseName(
             fromOrderedTexts: topTexts.isEmpty ? allTexts : topTexts
-        ) else { throw HoverResolverError.conversationNameNotFound }
+        ) else {
+            LarkPeekDiagnostics.accessibility.error(
+                "event=resolve_failed trigger=\(trigger, privacy: .public) stage=name_lookup code=conversation_name_not_found nodes=\(records.count) rowWidth=\(frame.width, format: .fixed(precision: 0)) rowHeight=\(frame.height, format: .fixed(precision: 0))"
+            )
+            throw HoverResolverError.conversationNameNotFound
+        }
+        LarkPeekDiagnostics.accessibility.info(
+            "event=resolve_succeeded trigger=\(trigger, privacy: .public) nodes=\(records.count) rowWidth=\(frame.width, format: .fixed(precision: 0)) rowHeight=\(frame.height, format: .fixed(precision: 0)) target=\(name, privacy: .private(mask: .hash))"
+        )
         return HoveredConversation(name: name, rowFrame: frame, rowTexts: allTexts)
+    }
+
+    private func loggedFailure(
+        _ error: HoverResolverError,
+        trigger: String,
+        stage: String
+    ) -> HoverResolverError {
+        LarkPeekDiagnostics.accessibility.error(
+            "event=resolve_failed trigger=\(trigger, privacy: .public) stage=\(stage, privacy: .public) code=\(error.diagnosticCode, privacy: .public)"
+        )
+        return error
     }
 
     private func bestConversationRow(startingAt element: AXUIElement) -> AXUIElement? {
