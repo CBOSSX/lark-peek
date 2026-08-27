@@ -229,7 +229,10 @@ public struct HoveredConversation: Equatable, Sendable {
     }
 
     public var threadHint: ThreadRowHint? {
-        ThreadRowHeuristics.hint(from: rowTexts.isEmpty ? [name] : rowTexts)
+        guard let hint = ThreadRowHeuristics.hint(from: rowTexts.isEmpty ? [name] : rowTexts),
+              ThreadRowHeuristics.matchesConversationTitle(name, hint: hint)
+        else { return nil }
+        return hint
     }
 }
 
@@ -346,6 +349,36 @@ public enum ThreadRowHeuristics {
             )
         }
         return nil
+    }
+
+    public static func matchesConversationTitle(_ title: String, hint: ThreadRowHint) -> Bool {
+        let text = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let senderMatch = rootSenderPattern.firstMatch(in: text, range: range),
+              let titleSender = capture(1, match: senderMatch, in: text),
+              let contentStart = Range(senderMatch.range, in: text)?.upperBound
+        else { return false }
+
+        let titleExcerpt = String(text[contentStart...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedTitleExcerpt = ConversationText.normalize(titleExcerpt)
+        let normalizedHintExcerpt = ConversationText.normalize(hint.rootExcerpt)
+        guard ConversationText.normalize(titleSender) == ConversationText.normalize(hint.rootSender),
+              !normalizedTitleExcerpt.isEmpty, !normalizedHintExcerpt.isEmpty
+        else { return false }
+
+        if normalizedTitleExcerpt == normalizedHintExcerpt { return true }
+
+        // Only tolerate a prefix relationship when Feishu explicitly exposes
+        // an ellipsis. Without that signal, a group named "owner: project" can
+        // otherwise look like the prefix of "owner: project 09:01 sender: …".
+        let titleWasTruncated = titleExcerpt.contains("…") || titleExcerpt.contains("...")
+        let hintWasTruncated = hint.rootExcerpt.contains("…") || hint.rootExcerpt.contains("...")
+        guard titleWasTruncated || hintWasTruncated else { return false }
+        let shorterCount = min(normalizedTitleExcerpt.count, normalizedHintExcerpt.count)
+        return shorterCount >= 8
+            && (normalizedTitleExcerpt.hasPrefix(normalizedHintExcerpt)
+                || normalizedHintExcerpt.hasPrefix(normalizedTitleExcerpt))
     }
 
     private static func capture(_ index: Int, match: NSTextCheckingResult, in text: String) -> String? {

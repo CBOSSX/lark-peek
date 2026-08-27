@@ -384,6 +384,36 @@ import Testing
     #expect(flattenedGroup.threadHint == nil)
 }
 
+@Test func ordinaryChatWithClockInMessageBodyIsNotClassifiedAsStandaloneThread() {
+    let flattened = HoveredConversation(
+        name: "CCM-platform-agent 群",
+        rowFrame: .zero,
+        rowTexts: [
+            "CCM-platform-agent 群 09:01 凌凌漆 : Codex 性价比雷达｜数据更新至 8 月 27 日 09:00 主结论：改回 gpt-5.6-luna high"
+        ]
+    )
+    let split = HoveredConversation(
+        name: "CCM-platform-agent 群",
+        rowFrame: .zero,
+        rowTexts: [
+            "CCM-platform-agent 群",
+            "09:01",
+            "凌凌漆 : Codex 性价比雷达｜数据更新至 8 月 27 日 09:00 主结论：改回 gpt-5.6-luna high"
+        ]
+    )
+    let groupNameContainingColon = HoveredConversation(
+        name: "Owner: CCM-platform-agent 群",
+        rowFrame: .zero,
+        rowTexts: [
+            "Owner: CCM-platform-agent 群 09:01 凌凌漆 : Codex 性价比雷达｜数据更新至 8 月 27 日 09:00 主结论：改回 gpt-5.6-luna high"
+        ]
+    )
+
+    #expect(flattened.threadHint == nil)
+    #expect(split.threadHint == nil)
+    #expect(groupNameContainingColon.threadHint == nil)
+}
+
 @Test func threadSearchMatcherRequiresOneHighConfidenceThread() throws {
     let hint = try #require(ThreadRowHeuristics.hint(from: [
         "曹沙沙: 辛苦大家更新下各业务线开发进展 14:12 田阁良: 已更新"
