@@ -36,15 +36,40 @@ public enum LarkCLIParser {
         let identities = root["identities"] as? [String: Any]
         let user = identities?["user"] as? [String: Any]
         let available = user?["available"] as? Bool ?? false
-        let verified = root["verified"] as? Bool ?? user?["verified"] as? Bool ?? false
-        let state: AuthStatus.State = available && verified ? .ready : .needsLogin
+        // The root verification can describe the automatically selected bot
+        // identity. Prefer the user-specific result so a ready bot cannot hide
+        // an expired or otherwise invalid user credential.
+        let verified = user?["verified"] as? Bool ?? root["verified"] as? Bool ?? false
         let scopeString = user?["scope"] as? String ?? ""
+        let scopes = Set(scopeString.split(separator: " ").map(String.init))
+        let hasRequiredScopes = Set(AuthStatus.requiredScopes).isSubset(of: scopes)
+        let state: AuthStatus.State = available && verified && hasRequiredScopes ? .ready : .needsLogin
         return AuthStatus(
             state: state,
             userName: user?["userName"] as? String,
             openID: user?["openId"] as? String,
             tokenStatus: user?["tokenStatus"] as? String,
-            scopes: Set(scopeString.split(separator: " ").map(String.init))
+            scopes: scopes
+        )
+    }
+
+    public static func authorizationRequest(from data: Data) throws -> AuthorizationRequest {
+        let root = try dictionary(from: data)
+        guard let rawURL = root["verification_url"] as? String,
+              let verificationURL = URL(string: rawURL),
+              verificationURL.scheme == "https",
+              let host = verificationURL.host,
+              ["accounts.feishu.cn", "accounts.larksuite.com"].contains(host),
+              let deviceCode = root["device_code"] as? String,
+              let expiresIn = root["expires_in"] as? Double ?? (root["expires_in"] as? Int).map(Double.init),
+              expiresIn > 0 else {
+            throw LarkCLIError.malformedResponse
+        }
+        _ = try AuthorizationCommand.complete(deviceCode: deviceCode).arguments()
+        return AuthorizationRequest(
+            verificationURL: verificationURL,
+            deviceCode: deviceCode,
+            expiresIn: expiresIn
         )
     }
 

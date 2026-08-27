@@ -23,7 +23,14 @@ public actor LarkCLIClient {
     }
 
     public func run(_ command: ReadOnlyCommand) async throws -> CLIResult {
-        let arguments = try command.arguments()
+        try await run(arguments: command.arguments())
+    }
+
+    public func run(_ command: AuthorizationCommand) async throws -> CLIResult {
+        try await run(arguments: command.arguments())
+    }
+
+    private func run(arguments: [String]) async throws -> CLIResult {
         let process = Process()
         let stdout = Pipe()
         let stderr = Pipe()

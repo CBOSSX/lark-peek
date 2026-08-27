@@ -53,6 +53,40 @@ public final class PeekModel: ObservableObject {
         await verifyAndPrewarm()
     }
 
+    public func authorize(openVerificationURL: (URL) -> Bool) async {
+        guard let client else { return }
+        let missingScopes = authStatus.missingRequiredScopes
+        guard !missingScopes.isEmpty else {
+            await verifyAndPrewarm()
+            return
+        }
+
+        authStatus.state = .checking
+        statusMessage = "正在准备飞书最小权限授权…"
+        do {
+            let result = try await client.run(.begin(scopes: missingScopes))
+            let request = try LarkCLIParser.authorizationRequest(from: result.data)
+            guard openVerificationURL(request.verificationURL) else {
+                authStatus.state = .needsLogin
+                statusMessage = "无法打开飞书授权页面，请重试。"
+                return
+            }
+
+            statusMessage = "请在浏览器中确认飞书只读权限…"
+            _ = try await client.run(.complete(deviceCode: request.deviceCode))
+            statusMessage = "授权成功，正在验证权限…"
+            await verifyAndPrewarm()
+        } catch is CancellationError {
+            authStatus.state = .needsLogin
+            statusMessage = "飞书授权已取消"
+        } catch {
+            // Keep the authorization action available after an expired device
+            // code, a browser cancellation, or a transient network failure.
+            authStatus.state = .needsLogin
+            statusMessage = error.localizedDescription
+        }
+    }
+
     public func peek(_ conversation: HoveredConversation) async {
         resetMessagePagination()
         state = .loading(conversation)
@@ -385,7 +419,10 @@ public final class PeekModel: ObservableObject {
             let auth = try await client.run(.authStatus)
             authStatus = try LarkCLIParser.authStatus(from: auth.data)
             guard authStatus.state == .ready else {
-                statusMessage = "lark-cli 用户登录尚未就绪"
+                let count = authStatus.missingRequiredScopes.count
+                statusMessage = count == AuthStatus.requiredScopes.count
+                    ? "需要授权飞书只读访问"
+                    : "还缺少 \(count) 项飞书只读权限"
                 return
             }
             statusMessage = "正在缓存最近会话索引…"

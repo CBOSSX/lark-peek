@@ -12,6 +12,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
     private var monitors: [Any] = []
     private var subscriptions = Set<AnyCancellable>()
     private var peekTask: Task<Void, Never>?
+    private var authorizationTask: Task<Void, Never>?
     private var optionHoldTask: Task<Void, Never>?
     private var isOptionHeld = false
     private var isOptionPeekActive = false
@@ -44,6 +45,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         peekTask?.cancel()
+        authorizationTask?.cancel()
         optionHoldTask?.cancel()
         for monitor in monitors { NSEvent.removeMonitor(monitor) }
         monitors.removeAll()
@@ -68,6 +70,9 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "检查辅助功能权限…", action: #selector(requestAccessibility), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "选择 lark-cli…", action: #selector(selectCLI), keyEquivalent: ""))
+        if model.authStatus.state == .needsLogin {
+            menu.addItem(NSMenuItem(title: "授权飞书只读访问…", action: #selector(authorizeLark), keyEquivalent: ""))
+        }
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "退出 Lark Peek", action: #selector(quit), keyEquivalent: "q"))
         for item in menu.items { item.target = self }
@@ -197,6 +202,15 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         panel.resolvesAliases = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         Task { await model.configureCLI(at: url) }
+    }
+
+    @objc private func authorizeLark() {
+        authorizationTask?.cancel()
+        authorizationTask = Task { [weak self] in
+            guard let self else { return }
+            await self.model.authorize { NSWorkspace.shared.open($0) }
+            self.authorizationTask = nil
+        }
     }
 
     @objc private func quit() {

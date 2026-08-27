@@ -35,10 +35,13 @@ Lark Peek 通过飞书官方 `lark-cli` 读取消息。请先安装 Node.js 20+�
 ```bash
 npx @larksuite/cli@latest install
 lark-cli config init
-lark-cli auth login
 ```
 
-登录时只授予会话和消息读取权限。启动 Lark Peek 后，再按系统提示授予 macOS 辅助功能权限；该权限只用于识别鼠标所在的飞书会话行，不会代替你点击界面。
+启动 Lark Peek 后，从菜单栏选择“授权飞书只读访问…”。应用只会申请当前缺少的
+`im:chat:read`、`im:message:readonly` 和 `search:message` 权限，并自动打开飞书授权页面；
+确认后会自动完成登录和权限验证，不需要在终端运行 `auth login`。
+
+再按系统提示授予 macOS 辅助功能权限；该权限只用于识别鼠标所在的飞书会话行，不会代替你点击界面。
 
 ## 怎么用
 

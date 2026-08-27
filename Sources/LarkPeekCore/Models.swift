@@ -175,6 +175,12 @@ public enum MessageTimeline {
 }
 
 public struct AuthStatus: Equatable, Sendable {
+    public static let requiredScopes = [
+        "im:chat:read",
+        "im:message:readonly",
+        "search:message"
+    ]
+
     public enum State: Equatable, Sendable {
         case checking
         case ready
@@ -187,6 +193,10 @@ public struct AuthStatus: Equatable, Sendable {
     public var openID: String?
     public var tokenStatus: String?
     public var scopes: Set<String>
+
+    public var missingRequiredScopes: Set<String> {
+        Set(Self.requiredScopes).subtracting(scopes)
+    }
 
     public init(
         state: State = .checking,
