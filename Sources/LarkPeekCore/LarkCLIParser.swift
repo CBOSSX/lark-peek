@@ -114,7 +114,8 @@ public enum LarkCLIParser {
             guard let rawChatID = row["chat_id"] as? String,
                   let chatID = validChatID(rawChatID),
                   let message = parseMessage(row, fallbackChatID: chatID),
-                  message.threadID != nil else { return nil }
+                  message.threadID != nil,
+                  message.isThreadRoot else { return nil }
             let name = (row["chat_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             let chat = LarkChat(
                 id: chatID,
@@ -187,6 +188,19 @@ public enum LarkCLIParser {
         let type = row["msg_type"] as? String ?? "text"
         let rawContent = stringify(row["content"])
         let deleted = row["deleted"] as? Bool ?? false
+        let threadID = deleted ? nil : validThreadID(row["thread_id"] as? String)
+        let threadPosition = parseInt64(row["thread_message_position"])
+        let hasReplyRelationship = ["root_id", "parent_id"].contains { key in
+            guard let value = row[key] as? String else { return false }
+            return !value.isEmpty && value != id
+        }
+        // lark-cli marks roots returned by +chat-messages-list with -1 and
+        // replies returned by +threads-messages-list with 0, 1, ... . Older
+        // output omitted the position on roots. root_id/parent_id, when a raw
+        // response happens to include them, take precedence over that fallback.
+        let isThreadRoot = threadID != nil
+            && !hasReplyRelationship
+            && (threadPosition == nil || threadPosition == -1)
         let parsedContent = readableContent(rawContent, type: type)
         let content: String
         if parsedContent.text == "[图片]", parsedContent.imageKeys.count == 1,
@@ -207,7 +221,8 @@ public enum LarkCLIParser {
             sharedChatID: deleted ? nil : parsedContent.sharedChatID,
             sharedChatName: deleted ? nil : parsedContent.sharedChatName,
             forwardedMessages: deleted ? [] : parsedContent.forwardedMessages,
-            threadID: deleted ? nil : validThreadID(row["thread_id"] as? String),
+            threadID: threadID,
+            isThreadRoot: isThreadRoot,
             deleted: deleted,
             updated: row["updated"] as? Bool ?? false
         )

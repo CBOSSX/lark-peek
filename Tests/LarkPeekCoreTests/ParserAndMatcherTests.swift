@@ -175,15 +175,25 @@ import Testing
 }
 
 @Test func parsesThreadMetadataAndReplies() throws {
-    let rootJSON = #"{"ok":true,"data":{"messages":[{"message_id":"om_root","chat_id":"oc_1","msg_type":"text","thread_id":"omt_topic","content":"测试一下话题。"}]}}"#
+    let rootJSON = #"{"ok":true,"data":{"messages":[{"message_id":"om_root","chat_id":"oc_1","msg_type":"text","thread_id":"omt_topic","thread_message_position":"-1","content":"测试一下话题。"}]}}"#
     let replyJSON = #"{"ok":true,"data":{"messages":[{"message_id":"om_reply","chat_id":"oc_1","msg_type":"text","thread_id":"omt_topic","thread_message_position":"0","sender":{"name":"曹博淳"},"content":"hi 你好"}],"has_more":false}}"#
 
     let root = try #require(LarkCLIParser.messages(from: Data(rootJSON.utf8), fallbackChatID: "oc_1").first)
     let replies = try LarkCLIParser.messagePage(from: Data(replyJSON.utf8), fallbackChatID: "oc_1")
 
     #expect(root.threadID == "omt_topic")
+    #expect(root.isThreadRoot)
+    #expect(replies.messages.first?.isThreadRoot == false)
     #expect(replies.messages.map(\.content) == ["hi 你好"])
     #expect(replies.nextPageToken == nil)
+}
+
+@Test func replyRelationshipsCannotCreateTopicRootCards() throws {
+    let json = #"{"ok":true,"data":{"messages":[{"message_id":"om_reply","chat_id":"oc_1","thread_id":"omt_topic","root_id":"om_root","parent_id":"om_root","content":"reply"}]}}"#
+    let message = try #require(LarkCLIParser.messages(from: Data(json.utf8), fallbackChatID: "oc_1").first)
+
+    #expect(message.threadID == "omt_topic")
+    #expect(!message.isThreadRoot)
 }
 
 @Test func parsesThreadSearchHitsWithChatContext() throws {

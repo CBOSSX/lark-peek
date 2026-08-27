@@ -208,6 +208,7 @@ final class PeekPanelController {
 
     func close(triggerID: String? = nil, reason: String = "panel_control") {
         dismissPresentedImage()
+        model.cancelTransientRequests()
         let trigger = triggerID ?? lastTriggerID ?? "none"
         guard panel.isVisible, closeTask == nil else {
             LarkPeekDiagnostics.panel.debug(
@@ -943,6 +944,9 @@ private struct MessageTimelineView: View {
                 MessageContentView(
                     message: message,
                     expandThreadByDefault: expandThreadsByDefault,
+                    onLoadThreadReplies: {
+                        await model.loadThreadReplies(for: message.id)
+                    },
                     onOpenImage: onOpenImage
                 )
             }
@@ -967,15 +971,17 @@ private struct MessageTimelineView: View {
 private struct MessageContentView: View {
     let message: LarkMessage
     let expandThreadByDefault: Bool
+    let onLoadThreadReplies: () async -> Void
     let onOpenImage: (PresentedImage) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             MessageBodyView(message: message, onOpenImage: onOpenImage)
-            if message.threadID != nil {
+            if message.threadID != nil, message.isThreadRoot {
                 TopicRepliesCard(
                     message: message,
                     initiallyExpanded: expandThreadByDefault,
+                    onLoadReplies: onLoadThreadReplies,
                     onOpenImage: onOpenImage
                 )
             }
@@ -1230,15 +1236,19 @@ private struct ForwardedMessagesCard: View {
 
 private struct TopicRepliesCard: View {
     let message: LarkMessage
+    let onLoadReplies: () async -> Void
     let onOpenImage: (PresentedImage) -> Void
     @State private var isExpanded: Bool
+    @State private var loadTask: Task<Void, Never>?
 
     init(
         message: LarkMessage,
         initiallyExpanded: Bool = false,
+        onLoadReplies: @escaping () async -> Void,
         onOpenImage: @escaping (PresentedImage) -> Void
     ) {
         self.message = message
+        self.onLoadReplies = onLoadReplies
         self.onOpenImage = onOpenImage
         _isExpanded = State(initialValue: initiallyExpanded)
     }
@@ -1246,8 +1256,15 @@ private struct TopicRepliesCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Button {
+                let willExpand = !isExpanded
                 withAnimation(.easeOut(duration: 0.16)) {
-                    isExpanded.toggle()
+                    isExpanded = willExpand
+                }
+                if willExpand, !message.threadRepliesLoaded, loadTask == nil {
+                    loadTask = Task {
+                        await onLoadReplies()
+                        loadTask = nil
+                    }
                 }
             } label: {
                 HStack(spacing: 7) {
@@ -1255,8 +1272,11 @@ private struct TopicRepliesCard: View {
                     Text("话题回复")
                         .fontWeight(.semibold)
                     Spacer()
-                    if !message.threadRepliesLoaded {
+                    if isExpanded, !message.threadRepliesLoaded {
                         ProgressView().controlSize(.mini)
+                    } else if !message.threadRepliesLoaded {
+                        Text("展开加载")
+                            .foregroundStyle(.secondary)
                     } else {
                         Text(replyCountLabel)
                             .foregroundStyle(.secondary)

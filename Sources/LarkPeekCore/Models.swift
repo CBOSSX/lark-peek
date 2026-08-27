@@ -93,6 +93,7 @@ public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
     public var sharedChatName: String?
     public var forwardedMessages: [ForwardedMessageItem]
     public var threadID: String?
+    public var isThreadRoot: Bool
     public var threadReplies: [LarkMessage]
     public var threadRepliesLoaded: Bool
     public var threadHasMore: Bool
@@ -112,6 +113,7 @@ public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
         sharedChatName: String? = nil,
         forwardedMessages: [ForwardedMessageItem] = [],
         threadID: String? = nil,
+        isThreadRoot: Bool? = nil,
         threadReplies: [LarkMessage] = [],
         threadRepliesLoaded: Bool = false,
         threadHasMore: Bool = false,
@@ -130,6 +132,7 @@ public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
         self.sharedChatName = sharedChatName
         self.forwardedMessages = forwardedMessages
         self.threadID = threadID
+        self.isThreadRoot = isThreadRoot ?? (threadID != nil)
         self.threadReplies = threadReplies
         self.threadRepliesLoaded = threadRepliesLoaded
         self.threadHasMore = threadHasMore

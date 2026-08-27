@@ -13,6 +13,11 @@ private struct StoredThreadResolution: Codable {
     let chat: LarkChat
 }
 
+private struct ThreadReplyTask {
+    let id: UUID
+    let task: Task<Void, Never>
+}
+
 public enum PeekState: Equatable {
     case waiting
     case loading(HoveredConversation)
@@ -38,6 +43,9 @@ public final class PeekModel: ObservableObject {
     private var imageCache: [ImageRequest: Data] = [:]
     private var imageCacheOrder: [ImageRequest] = []
     private var imageCacheBytes = 0
+    private var threadReplyTasks: [String: ThreadReplyTask] = [:]
+    private var activeThreadReplyRequestCount = 0
+    private var pendingThreadReplyRequests: [CheckedContinuation<Void, Never>] = []
     private let defaults: UserDefaults
     private let workingDirectory: URL
 
@@ -96,6 +104,7 @@ public final class PeekModel: ObservableObject {
     }
 
     public func peek(_ conversation: HoveredConversation) async {
+        cancelTransientRequests()
         let trigger = LarkPeekDiagnostics.triggerID ?? "none"
         diagnosticTriggerID = trigger
         resetMessagePagination()
@@ -262,12 +271,14 @@ public final class PeekModel: ObservableObject {
     }
 
     public func dismiss() {
+        cancelTransientRequests()
         resetMessagePagination()
         diagnosticTriggerID = nil
         state = .waiting
     }
 
     public func presentError(_ message: String) {
+        cancelTransientRequests()
         resetMessagePagination()
         state = .error(nil, message)
     }
@@ -326,14 +337,8 @@ public final class PeekModel: ObservableObject {
             }
             let mergedMessages = MessageTimeline.merging(page.messages, into: currentMessages)
             let namedMessages = await resolveSharedChatNames(in: mergedMessages, using: client)
-            let threadedMessages = await hydrateThreadReplies(in: namedMessages, using: client)
-            state = .messages(
-                conversation,
-                chat,
-                threadedMessages,
-                Date()
-            )
-            let hydratedMessages = await downloadImages(in: threadedMessages, using: client)
+            state = .messages(conversation, chat, namedMessages, Date())
+            let hydratedMessages = await downloadImages(in: namedMessages, using: client)
             guard case let .messages(_, hydratedChat, _, _) = state,
                   hydratedChat.id == chat.id else { return }
             state = .messages(conversation, chat, hydratedMessages, Date())
@@ -531,12 +536,7 @@ public final class PeekModel: ObservableObject {
         guard case let .messages(_, namedChat, _, _) = state,
               namedChat.id == chat.id else { return }
         state = .messages(conversation, chat, namedMessages, Date())
-        let threadedMessages = await hydrateThreadReplies(in: namedMessages, using: client)
-        try Task.checkCancellation()
-        guard case let .messages(_, threadedChat, _, _) = state,
-              threadedChat.id == chat.id else { return }
-        state = .messages(conversation, chat, threadedMessages, Date())
-        let hydratedMessages = await downloadImages(in: threadedMessages, using: client)
+        let hydratedMessages = await downloadImages(in: namedMessages, using: client)
         try Task.checkCancellation()
         guard case let .messages(_, visibleChat, _, _) = state,
               visibleChat.id == chat.id else { return }
@@ -774,48 +774,101 @@ public final class PeekModel: ObservableObject {
         let data: Data?
     }
 
-    private func hydrateThreadReplies(
-        in messages: [LarkMessage],
-        using client: LarkCLIClient
-    ) async -> [LarkMessage] {
-        let threadIDs = Array(Set(messages.compactMap { message -> String? in
-            guard !message.threadRepliesLoaded else { return nil }
-            return message.threadID
-        }))
-        guard !threadIDs.isEmpty else { return messages }
+    public func loadThreadReplies(for messageID: String) async {
+        guard case let .messages(_, _, messages, _) = state,
+              let root = messages.first(where: { $0.id == messageID }),
+              root.isThreadRoot,
+              let threadID = root.threadID,
+              !root.threadRepliesLoaded else { return }
 
-        var pages: [String: LarkCLIParser.MessagePage] = [:]
-        for start in stride(from: 0, to: threadIDs.count, by: 3) {
-            if Task.isCancelled { return messages }
-            let batch = Array(threadIDs[start..<min(start + 3, threadIDs.count)])
-            let results = await withTaskGroup(of: (String, LarkCLIParser.MessagePage?).self) { group in
-                for threadID in batch {
-                    group.addTask {
-                        guard let result = try? await client.run(.threadMessages(threadID: threadID)),
-                              let page = try? LarkCLIParser.messagePage(from: result.data, fallbackChatID: "")
-                        else { return (threadID, nil) }
-                        return (threadID, page)
-                    }
-                }
-                var values: [(String, LarkCLIParser.MessagePage?)] = []
-                for await value in group { values.append(value) }
-                return values
-            }
-            for (threadID, page) in results {
-                if let page { pages[threadID] = page }
-            }
+        if let existing = threadReplyTasks[threadID] {
+            await existing.task.value
+            return
         }
 
-        let requested = Set(threadIDs)
-        return messages.map { message in
-            guard let threadID = message.threadID, requested.contains(threadID) else { return message }
-            var message = message
-            message.threadRepliesLoaded = true
-            if let page = pages[threadID] {
-                message.threadReplies = page.messages.sorted(by: LarkMessage.isChronologicallyBefore)
-                message.threadHasMore = page.nextPageToken != nil
+        let taskID = UUID()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.threadReplyTasks[threadID]?.id == taskID {
+                    self.threadReplyTasks[threadID] = nil
+                }
             }
-            return message
+            await self.performThreadReplyLoad(threadID: threadID, chatID: root.chatID)
+        }
+        threadReplyTasks[threadID] = ThreadReplyTask(id: taskID, task: task)
+        await task.value
+    }
+
+    public func cancelTransientRequests() {
+        let tasks = threadReplyTasks.values.map(\.task)
+        threadReplyTasks.removeAll()
+        for task in tasks { task.cancel() }
+    }
+
+    private func performThreadReplyLoad(threadID: String, chatID: String) async {
+        let trigger = LarkPeekDiagnostics.triggerID ?? diagnosticTriggerID ?? "none"
+        await acquireThreadReplyRequestSlot()
+        defer { releaseThreadReplyRequestSlot() }
+        do {
+            try Task.checkCancellation()
+            let client = try requireClient()
+            let result = try await client.run(.threadMessages(threadID: threadID, pageSize: 50))
+            let page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: chatID)
+            try Task.checkCancellation()
+            guard case let .messages(conversation, chat, currentMessages, _) = state,
+                  chat.id == chatID else { return }
+
+            let replies = page.messages.sorted(by: LarkMessage.isChronologicallyBefore)
+            let updatedMessages = currentMessages.map { current -> LarkMessage in
+                guard current.isThreadRoot, current.threadID == threadID else { return current }
+                var current = current
+                current.threadReplies = replies
+                current.threadRepliesLoaded = true
+                current.threadHasMore = page.nextPageToken != nil
+                return current
+            }
+            state = .messages(conversation, chat, updatedMessages, Date())
+
+            let hydratedMessages = await downloadImages(in: updatedMessages, using: client)
+            try Task.checkCancellation()
+            guard case let .messages(_, visibleChat, visibleMessages, _) = state,
+                  visibleChat.id == chatID else { return }
+            state = .messages(
+                conversation,
+                chat,
+                MessageTimeline.merging(hydratedMessages, into: visibleMessages),
+                Date()
+            )
+            threadMatchLogger.info(
+                "event=lazy_thread_loaded trigger=\(trigger, privacy: .public) chat=\(chatID, privacy: .private(mask: .hash)) replies=\(replies.count) hasMore=\(page.nextPageToken != nil)"
+            )
+        } catch is CancellationError {
+            threadMatchLogger.info(
+                "event=lazy_thread_cancelled trigger=\(trigger, privacy: .public) chat=\(chatID, privacy: .private(mask: .hash))"
+            )
+        } catch {
+            threadMatchLogger.error(
+                "event=lazy_thread_failed trigger=\(trigger, privacy: .public) chat=\(chatID, privacy: .private(mask: .hash)) code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)"
+            )
+        }
+    }
+
+    private func acquireThreadReplyRequestSlot() async {
+        if activeThreadReplyRequestCount < 3 {
+            activeThreadReplyRequestCount += 1
+            return
+        }
+        await withCheckedContinuation { continuation in
+            pendingThreadReplyRequests.append(continuation)
+        }
+    }
+
+    private func releaseThreadReplyRequestSlot() {
+        if pendingThreadReplyRequests.isEmpty {
+            activeThreadReplyRequestCount -= 1
+        } else {
+            pendingThreadReplyRequests.removeFirst().resume()
         }
     }
 
