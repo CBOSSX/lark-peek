@@ -46,6 +46,28 @@ import Testing
     #expect(installation.prefixArguments == [cli.path])
 }
 
+@Test func acceptsPreferredCLISymbolicLinkWithoutResolvingItsName() throws {
+    let directory = try makeTemporaryDirectory()
+    let target = directory.appendingPathComponent("run.js")
+    let cli = directory.appendingPathComponent("lark-cli")
+    let node = directory.appendingPathComponent("node")
+    try makeExecutable(target, contents: "#!/usr/bin/env node\n")
+    try FileManager.default.createSymbolicLink(at: cli, withDestinationURL: target)
+    try makeExecutable(node, contents: "node-placeholder")
+
+    let resolver = LarkCLIResolver(
+        homeDirectory: directory,
+        inheritedPath: "",
+        additionalSearchDirectories: [directory],
+        includeStandardLocations: false
+    )
+    let installation = try resolver.resolve(preferredCLIURL: cli)
+
+    #expect(installation.cliURL == cli)
+    #expect(installation.launchExecutableURL == node)
+    #expect(installation.prefixArguments == [cli.path])
+}
+
 @Test func automaticDiscoveryCanPairCLIAndRuntimeAcrossManagedDirectories() throws {
     let root = try makeTemporaryDirectory()
     let broken = root.appendingPathComponent("broken", isDirectory: true)

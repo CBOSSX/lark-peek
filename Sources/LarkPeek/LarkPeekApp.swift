@@ -192,6 +192,9 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
+        // Homebrew installs lark-cli as a symlink to run.js. Preserve the
+        // selected link so validation sees the expected executable name.
+        panel.resolvesAliases = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         Task { await model.configureCLI(at: url) }
     }
