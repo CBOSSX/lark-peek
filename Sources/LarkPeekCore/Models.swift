@@ -80,6 +80,16 @@ public struct ForwardedMessageItem: Codable, Hashable, Sendable {
     }
 }
 
+public struct CalendarShare: Codable, Hashable, Sendable {
+    public var startTime: Date
+    public var endTime: Date
+
+    public init(startTime: Date, endTime: Date) {
+        self.startTime = startTime
+        self.endTime = endTime
+    }
+}
+
 public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
     public let id: String
     public var chatID: String
@@ -91,6 +101,7 @@ public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
     public var images: [MessageImage]
     public var sharedChatID: String?
     public var sharedChatName: String?
+    public var calendarShare: CalendarShare?
     public var forwardedMessages: [ForwardedMessageItem]
     public var threadID: String?
     public var isThreadRoot: Bool
@@ -111,6 +122,7 @@ public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
         images: [MessageImage] = [],
         sharedChatID: String? = nil,
         sharedChatName: String? = nil,
+        calendarShare: CalendarShare? = nil,
         forwardedMessages: [ForwardedMessageItem] = [],
         threadID: String? = nil,
         isThreadRoot: Bool? = nil,
@@ -130,6 +142,7 @@ public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
         self.images = images
         self.sharedChatID = sharedChatID
         self.sharedChatName = sharedChatName
+        self.calendarShare = calendarShare
         self.forwardedMessages = forwardedMessages
         self.threadID = threadID
         self.isThreadRoot = isThreadRoot ?? (threadID != nil)

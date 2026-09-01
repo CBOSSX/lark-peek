@@ -220,6 +220,7 @@ public enum LarkCLIParser {
             images: deleted ? [] : parsedContent.imageKeys.map { MessageImage(key: $0) },
             sharedChatID: deleted ? nil : parsedContent.sharedChatID,
             sharedChatName: deleted ? nil : parsedContent.sharedChatName,
+            calendarShare: deleted ? nil : parsedContent.calendarShare,
             forwardedMessages: deleted ? [] : parsedContent.forwardedMessages,
             threadID: threadID,
             isThreadRoot: isThreadRoot,
@@ -282,16 +283,28 @@ public enum LarkCLIParser {
         let imageKeys: [String]
         let sharedChatID: String?
         let sharedChatName: String?
+        let calendarShare: CalendarShare?
         let forwardedMessages: [ForwardedMessageItem]
     }
 
     private static func readableContent(_ raw: String, type: String) -> ReadableContent {
+        if let calendarShare = calendarShare(in: raw) {
+            return ReadableContent(
+                text: "日历分享",
+                imageKeys: [],
+                sharedChatID: nil,
+                sharedChatName: nil,
+                calendarShare: calendarShare,
+                forwardedMessages: []
+            )
+        }
         if type == "interactive", let markup = cardMarkup(in: raw) {
             return ReadableContent(
                 text: markup,
                 imageKeys: imageKeys(in: raw),
                 sharedChatID: sharedChatID(in: raw),
                 sharedChatName: nil,
+                calendarShare: nil,
                 forwardedMessages: []
             )
         }
@@ -302,6 +315,7 @@ public enum LarkCLIParser {
                 imageKeys: imageKeys(in: raw),
                 sharedChatID: nil,
                 sharedChatName: nil,
+                calendarShare: nil,
                 forwardedMessages: items
             )
         }
@@ -313,6 +327,19 @@ public enum LarkCLIParser {
                 imageKeys: imageKeys(in: raw),
                 sharedChatID: sharedChatID(in: raw),
                 sharedChatName: nil,
+                calendarShare: nil,
+                forwardedMessages: []
+            )
+        }
+
+        if let value = object["text"] as? String,
+           let calendarShare = calendarShare(in: value) {
+            return ReadableContent(
+                text: "日历分享",
+                imageKeys: [],
+                sharedChatID: nil,
+                sharedChatName: nil,
+                calendarShare: calendarShare,
                 forwardedMessages: []
             )
         }
@@ -340,8 +367,39 @@ public enum LarkCLIParser {
             imageKeys: images,
             sharedChatID: sharedChatID,
             sharedChatName: sharedChatName,
+            calendarShare: nil,
             forwardedMessages: []
         )
+    }
+
+    private static func calendarShare(in text: String) -> CalendarShare? {
+        let bodies = matches(
+            in: text,
+            pattern: #"(?i)<\s*calendar_share\b[^>]*>([\s\S]*?)<\s*/\s*calendar_share\s*>"#,
+            captureGroup: 1
+        )
+        guard let body = bodies.first?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let range = captures(
+                in: body,
+                pattern: #"^(.+?)\s*[~～]\s*(.+?)$"#
+              ),
+              let startTime = parseCalendarShareDate(range[0]),
+              let endTime = parseCalendarShareDate(range[1]),
+              endTime >= startTime else { return nil }
+        return CalendarShare(startTime: startTime, endTime: endTime)
+    }
+
+    private static func parseCalendarShareDate(_ value: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        for format in ["yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm"] {
+            formatter.dateFormat = format
+            if let date = formatter.date(from: value) { return date }
+        }
+        return nil
     }
 
     private static func forwardedMessageItems(in text: String) -> [ForwardedMessageItem] {
@@ -489,6 +547,16 @@ public enum LarkCLIParser {
         return expression.matches(in: text, range: range).compactMap { match in
             guard captureGroup < match.numberOfRanges,
                   let range = Range(match.range(at: captureGroup), in: text) else { return nil }
+            return String(text[range])
+        }
+    }
+
+    private static func captures(in text: String, pattern: String) -> [String]? {
+        guard let expression = try? NSRegularExpression(pattern: pattern),
+              let match = expression.firstMatch(in: text, range: NSRange(text.startIndex..., in: text))
+        else { return nil }
+        return (1..<match.numberOfRanges).compactMap { index in
+            guard let range = Range(match.range(at: index), in: text) else { return nil }
             return String(text[range])
         }
     }

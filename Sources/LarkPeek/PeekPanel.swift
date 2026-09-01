@@ -999,6 +999,8 @@ private struct MessageBodyView: View {
         VStack(alignment: .leading, spacing: 8) {
             if !message.forwardedMessages.isEmpty {
                 ForwardedMessagesCard(items: message.forwardedMessages)
+            } else if let calendarShare = message.calendarShare {
+                CalendarShareCard(calendarShare: calendarShare)
             } else if message.sharedChatID != nil {
                 sharedChatCard
             } else if message.type == "interactive" {
@@ -1156,6 +1158,68 @@ private struct MessageBodyView: View {
             sourceFrame: sourceFrame
         ))
     }
+}
+
+private struct CalendarShareCard: View {
+    let calendarShare: CalendarShare
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "calendar")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 34, height: 34)
+                .background(Color.orange.gradient, in: RoundedRectangle(cornerRadius: 9))
+            VStack(alignment: .leading, spacing: 3) {
+                Text("日历分享")
+                    .font(.system(size: 12, weight: .semibold))
+                Text(dateText)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Text(timeText)
+                    .font(.system(size: 13, weight: .medium))
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.09), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.orange.opacity(0.18), lineWidth: 1)
+        }
+    }
+
+    private var dateText: String {
+        Self.dateFormatter.string(from: calendarShare.startTime)
+    }
+
+    private var timeText: String {
+        if Calendar.current.isDate(calendarShare.startTime, inSameDayAs: calendarShare.endTime) {
+            return "\(Self.timeFormatter.string(from: calendarShare.startTime)) – \(Self.timeFormatter.string(from: calendarShare.endTime))"
+        }
+        return "\(Self.dateTimeFormatter.string(from: calendarShare.startTime)) – \(Self.dateTimeFormatter.string(from: calendarShare.endTime))"
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.setLocalizedDateFormatFromTemplate("yMMMMdEEEE")
+        return formatter
+    }()
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.setLocalizedDateFormatFromTemplate("HHmm")
+        return formatter
+    }()
+
+    private static let dateTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.setLocalizedDateFormatFromTemplate("MdHHmm")
+        return formatter
+    }()
 }
 
 private struct ForwardedMessagesCard: View {

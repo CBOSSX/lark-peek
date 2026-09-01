@@ -223,6 +223,33 @@ import Testing
     #expect(chat.id == "oc_shared")
 }
 
+@Test func parsesCalendarShareIntoStructuredTimeRange() throws {
+    let content = """
+    <calendar_share open_calendar_id="feishu.cn_example@group.calendar.feishu.cn" open_event_id="event_0">
+    2026-07-21 18:00:00 ~ 2026-07-21 21:00:00
+    </calendar_share>
+    """
+    let contentData = try JSONEncoder().encode(content)
+    let encodedContent = try #require(String(data: contentData, encoding: .utf8))
+    let json = #"{"ok":true,"data":{"messages":[{"message_id":"om_calendar","msg_type":"text","content":\#(encodedContent)}]}}"#
+    let message = try #require(LarkCLIParser.messages(from: Data(json.utf8), fallbackChatID: "oc_1").first)
+    let calendarShare = try #require(message.calendarShare)
+
+    #expect(message.content == "日历分享")
+    #expect(Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: calendarShare.startTime) == DateComponents(year: 2026, month: 7, day: 21, hour: 18, minute: 0))
+    #expect(Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: calendarShare.endTime) == DateComponents(year: 2026, month: 7, day: 21, hour: 21, minute: 0))
+    #expect(!message.content.contains("open_calendar_id"))
+    #expect(!message.content.contains("open_event_id"))
+}
+
+@Test func parsesCalendarShareNestedInTextContent() throws {
+    let json = #"{"ok":true,"data":{"messages":[{"message_id":"om_calendar","msg_type":"calendar","content":{"text":"<calendar_share>2026-07-21 18:00 ~ 2026-07-21 21:00</calendar_share>"}}]}}"#
+    let message = try #require(LarkCLIParser.messages(from: Data(json.utf8), fallbackChatID: "oc_1").first)
+
+    #expect(message.calendarShare != nil)
+    #expect(message.content == "日历分享")
+}
+
 @Test func parsesDownloadedResourcePath() throws {
     let json = #"{"ok":true,"data":{"saved_path":"lark-peek-image-safe.png","size_bytes":42}}"#
     #expect(try LarkCLIParser.downloadedResourcePath(from: Data(json.utf8)) == "lark-peek-image-safe.png")
