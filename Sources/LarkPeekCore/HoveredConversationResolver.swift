@@ -63,6 +63,38 @@ public enum LarkApplicationIdentity {
             bundleIdentifier == root || bundleIdentifier.hasPrefix(root + ".")
         }
     }
+
+    public static func isMainApplication(bundleIdentifier: String?) -> Bool {
+        guard let bundleIdentifier else { return false }
+        return bundleIdentifierRoots.contains(bundleIdentifier)
+    }
+}
+
+enum ConversationRowGeometry {
+    static let widthRange: ClosedRange<CGFloat> = 250...800
+    static let heightRange: ClosedRange<CGFloat> = 44...90
+
+    static func isCandidate(_ frame: CGRect, containing point: CGPoint) -> Bool {
+        widthRange.contains(frame.width)
+            && heightRange.contains(frame.height)
+            && frame.insetBy(dx: -1, dy: -1).contains(point)
+    }
+
+    static func prefers(_ lhs: CGRect, over rhs: CGRect) -> Bool {
+        if lhs.width != rhs.width { return lhs.width > rhs.width }
+        return lhs.height > rhs.height
+    }
+
+    static func horizontalProbePoints(around point: CGPoint) -> [CGPoint] {
+        let distances = stride(from: CGFloat(32), through: 352, by: 32)
+        return distances.flatMap { distance in
+            [
+                CGPoint(x: point.x - distance, y: point.y),
+                CGPoint(x: point.x + distance, y: point.y)
+            ]
+        }
+        .filter { $0.x >= 0 }
+    }
 }
 
 @MainActor
@@ -117,9 +149,16 @@ public final class HoveredConversationResolver {
             throw loggedFailure(.pointerNotOverLark, trigger: trigger, stage: "process_identity")
         }
 
-        guard let row = bestConversationRow(startingAt: hit), let frame = frame(of: row) else {
+        guard let lookup = conversationRow(
+            startingAt: hit,
+            point: point,
+            systemWide: systemWide,
+            trigger: trigger
+        ) else {
             throw loggedFailure(.conversationRowNotFound, trigger: trigger, stage: "row_lookup")
         }
+        let row = lookup.element
+        let frame = lookup.frame
         let records = textRecords(in: row)
         let topLineLimit = frame.minY + frame.height * 0.58
         let topTexts = records
@@ -138,7 +177,7 @@ public final class HoveredConversationResolver {
             throw HoverResolverError.conversationNameNotFound
         }
         LarkPeekDiagnostics.accessibility.info(
-            "event=resolve_succeeded trigger=\(trigger, privacy: .public) nodes=\(records.count) rowWidth=\(frame.width, format: .fixed(precision: 0)) rowHeight=\(frame.height, format: .fixed(precision: 0)) target=\(name, privacy: .private(mask: .hash))"
+            "event=resolve_succeeded trigger=\(trigger, privacy: .public) strategy=\(lookup.strategy, privacy: .public) scanned=\(lookup.scanned) nodes=\(records.count) rowWidth=\(frame.width, format: .fixed(precision: 0)) rowHeight=\(frame.height, format: .fixed(precision: 0)) target=\(name, privacy: .private(mask: .hash))"
         )
         return HoveredConversation(name: name, rowFrame: frame, rowTexts: allTexts)
     }
@@ -154,23 +193,221 @@ public final class HoveredConversationResolver {
         return error
     }
 
-    private func bestConversationRow(startingAt element: AXUIElement) -> AXUIElement? {
+    private struct RowLookup {
+        let element: AXUIElement
+        let frame: CGRect
+        let strategy: String
+        let scanned: Int
+    }
+
+    private struct DescendantSearch {
+        let match: (element: AXUIElement, frame: CGRect)?
+        let scanned: Int
+        let roots: Int
+    }
+
+    private func conversationRow(
+        startingAt element: AXUIElement,
+        point: CGPoint,
+        systemWide: AXUIElement,
+        trigger: String
+    ) -> RowLookup? {
+        if let match = bestAncestorConversationRow(startingAt: element, point: point) {
+            return RowLookup(element: match.element, frame: match.frame, strategy: "ancestor", scanned: 0)
+        }
+        let descendantSearch = bestDescendantConversationRow(startingAt: element, point: point)
+        if let match = descendantSearch.match {
+            return RowLookup(
+                element: match.element,
+                frame: match.frame,
+                strategy: "descendant",
+                scanned: descendantSearch.scanned
+            )
+        }
+
+        var probeCount = 0
+        for probe in ConversationRowGeometry.horizontalProbePoints(around: point) {
+            probeCount += 1
+            var probeHit: AXUIElement?
+            guard AXUIElementCopyElementAtPosition(
+                systemWide,
+                Float(probe.x),
+                Float(probe.y),
+                &probeHit
+            ) == .success, let probeHit else { continue }
+            var probePID: pid_t = 0
+            guard AXUIElementGetPid(probeHit, &probePID) == .success,
+                  let probeApp = NSRunningApplication(processIdentifier: probePID),
+                  LarkApplicationIdentity.matches(bundleIdentifier: probeApp.bundleIdentifier),
+                  let match = bestAncestorConversationRow(startingAt: probeHit, point: point) else {
+                continue
+            }
+            return RowLookup(
+                element: match.element,
+                frame: match.frame,
+                strategy: "horizontal_probe",
+                scanned: descendantSearch.scanned + probeCount
+            )
+        }
+        // Probing text or avatar positions can cause Electron to materialize a
+        // previously cold accessibility subtree. Retry the container walk once.
+        let retrySearch = bestDescendantConversationRow(startingAt: element, point: point)
+        if let match = retrySearch.match {
+            return RowLookup(
+                element: match.element,
+                frame: match.frame,
+                strategy: "descendant_retry",
+                scanned: descendantSearch.scanned + retrySearch.scanned + probeCount
+            )
+        }
+        let applicationSearch = bestApplicationConversationRow(point: point)
+        if let match = applicationSearch.match {
+            return RowLookup(
+                element: match.element,
+                frame: match.frame,
+                strategy: "application_root",
+                scanned: descendantSearch.scanned
+                    + retrySearch.scanned
+                    + applicationSearch.scanned
+                    + probeCount
+            )
+        }
+        let hitFrame = frame(of: element)
+        let hitRole = stringAttribute(element, kAXRoleAttribute as CFString) ?? "unknown"
+        let hitWidth = Double(hitFrame?.width ?? -1)
+        let hitHeight = Double(hitFrame?.height ?? -1)
+        LarkPeekDiagnostics.accessibility.error(
+            "event=row_lookup_exhausted trigger=\(trigger, privacy: .public) hitRole=\(hitRole, privacy: .public) hitWidth=\(hitWidth, format: .fixed(precision: 0)) hitHeight=\(hitHeight, format: .fixed(precision: 0)) roots=\(descendantSearch.roots + retrySearch.roots) scanned=\(descendantSearch.scanned + retrySearch.scanned) appScanned=\(applicationSearch.scanned) probes=\(probeCount)"
+        )
+        return nil
+    }
+
+    private func bestAncestorConversationRow(
+        startingAt element: AXUIElement,
+        point: CGPoint
+    ) -> (element: AXUIElement, frame: CGRect)? {
         var candidates: [(element: AXUIElement, frame: CGRect)] = []
         var current: AXUIElement? = element
         for _ in 0..<14 {
             guard let item = current else { break }
             if let value = frame(of: item),
-               (250...800).contains(value.width),
-               (44...90).contains(value.height),
+               ConversationRowGeometry.isCandidate(value, containing: point),
                !textRecords(in: item, maximumDepth: 6).isEmpty {
                 candidates.append((item, value))
             }
             current = elementAttribute(item, kAXParentAttribute as CFString)
         }
-        return candidates.max { lhs, rhs in
-            if lhs.frame.width != rhs.frame.width { return lhs.frame.width < rhs.frame.width }
-            return lhs.frame.height < rhs.frame.height
-        }?.element
+        return candidates.max {
+            ConversationRowGeometry.prefers($1.frame, over: $0.frame)
+        }
+    }
+
+    private func bestDescendantConversationRow(
+        startingAt element: AXUIElement,
+        point: CGPoint
+    ) -> DescendantSearch {
+        var root: AXUIElement? = element
+        var totalScanned = 0
+        var roots = 0
+        for _ in 0..<8 {
+            guard let item = root else { break }
+            roots += 1
+            if let rootFrame = frame(of: item),
+               (!rootFrame.insetBy(dx: -1, dy: -1).contains(point) || rootFrame.width > 900) {
+                root = elementAttribute(item, kAXParentAttribute as CFString)
+                continue
+            }
+            let result = bestDescendantConversationRow(
+                in: item,
+                point: point,
+                limit: 192
+            )
+            totalScanned += result.scanned
+            if let match = result.match {
+                return DescendantSearch(match: match, scanned: totalScanned, roots: roots)
+            }
+            root = elementAttribute(item, kAXParentAttribute as CFString)
+        }
+        return DescendantSearch(match: nil, scanned: totalScanned, roots: roots)
+    }
+
+    private func bestApplicationConversationRow(point: CGPoint) -> DescendantSearch {
+        guard let app = NSWorkspace.shared.runningApplications.first(where: { app in
+            LarkApplicationIdentity.isMainApplication(bundleIdentifier: app.bundleIdentifier)
+        }) else {
+            return DescendantSearch(match: nil, scanned: 0, roots: 0)
+        }
+
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        let warmed = warmAccessibilityTree(root, maximumDepth: 24, limit: 4_096)
+        let search = bestDescendantConversationRow(
+            in: root,
+            point: point,
+            limit: 4_096,
+            maximumDepth: 24
+        )
+        return DescendantSearch(
+            match: search.match,
+            scanned: warmed + search.scanned,
+            roots: 1
+        )
+    }
+
+    private func warmAccessibilityTree(
+        _ root: AXUIElement,
+        maximumDepth: Int,
+        limit: Int
+    ) -> Int {
+        var stack: [(element: AXUIElement, depth: Int)] = [(root, 0)]
+        var scanned = 0
+        while let current = stack.popLast(), scanned < limit {
+            scanned += 1
+            // Electron lazily materializes web accessibility layout. Reading
+            // children alone leaves conversation rows frameless after launch;
+            // touching role and geometry forces the renderer to publish them.
+            _ = stringAttribute(current.element, kAXRoleAttribute as CFString)
+            _ = frame(of: current.element)
+            guard current.depth < maximumDepth else { continue }
+            for child in children(of: current.element).reversed() {
+                stack.append((child, current.depth + 1))
+            }
+        }
+        return scanned
+    }
+
+    private func bestDescendantConversationRow(
+        in root: AXUIElement,
+        point: CGPoint,
+        limit: Int,
+        maximumDepth: Int = 5
+    ) -> (match: (element: AXUIElement, frame: CGRect)?, scanned: Int) {
+        var candidates: [(element: AXUIElement, frame: CGRect)] = []
+        var stack: [(element: AXUIElement, depth: Int)] = [(root, 0)]
+        var scanned = 0
+
+        while let current = stack.popLast(), scanned < limit {
+            guard current.depth < maximumDepth else { continue }
+            for child in children(of: current.element) {
+                guard scanned < limit else { break }
+                scanned += 1
+                let childFrame = frame(of: child)
+                if let childFrame,
+                   !childFrame.insetBy(dx: -1, dy: -1).contains(point) {
+                    continue
+                }
+                if let childFrame,
+                   ConversationRowGeometry.isCandidate(childFrame, containing: point),
+                   !textRecords(in: child, maximumDepth: 6).isEmpty {
+                    candidates.append((child, childFrame))
+                }
+                stack.append((child, current.depth + 1))
+            }
+        }
+
+        let match = candidates.max {
+            ConversationRowGeometry.prefers($1.frame, over: $0.frame)
+        }
+        return (match, scanned)
     }
 
     private struct TextRecord {
