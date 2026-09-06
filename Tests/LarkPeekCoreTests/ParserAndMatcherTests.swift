@@ -37,6 +37,25 @@ import Testing
     #expect(MessageTimeline.merging(older, into: current).map(\.id) == ["om_1", "om_2", "om_3"])
 }
 
+@Test func staleHydrationSnapshotCannotRemoveAnAlreadyPrependedPage() {
+    let sender = MessageSender(name: "A")
+    let hydratedImage = MessageImage(key: "img_2", data: Data([0x01]), attempted: true)
+    let visibleMessages = [
+        LarkMessage(id: "om_1", chatID: "oc_1", createTime: Date(timeIntervalSince1970: 1), sender: sender, content: "1"),
+        LarkMessage(id: "om_2", chatID: "oc_1", createTime: Date(timeIntervalSince1970: 2), sender: sender, content: "2", images: [MessageImage(key: "img_2")]),
+        LarkMessage(id: "om_3", chatID: "oc_1", createTime: Date(timeIntervalSince1970: 3), sender: sender, content: "3")
+    ]
+    let staleHydrationSnapshot = [
+        LarkMessage(id: "om_2", chatID: "oc_1", createTime: Date(timeIntervalSince1970: 2), sender: sender, content: "2", images: [hydratedImage]),
+        visibleMessages[2]
+    ]
+
+    let merged = MessageTimeline.merging(staleHydrationSnapshot, into: visibleMessages)
+
+    #expect(merged.map(\.id) == ["om_1", "om_2", "om_3"])
+    #expect(merged[1].images.first?.data == Data([0x01]))
+}
+
 @Test func messageTimelinePreservesHydratedStateForOverlappingPages() throws {
     let sender = MessageSender(name: "A")
     let imageData = Data([0x01, 0x02, 0x03])

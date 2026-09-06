@@ -10,13 +10,18 @@ let package = Package(
     ],
     targets: [
         .target(name: "LarkPeekCore"),
+        .target(name: "LarkPeekTimeline", dependencies: ["LarkPeekCore"]),
         .executableTarget(
             name: "LarkPeek",
-            dependencies: ["LarkPeekCore"]
+            dependencies: ["LarkPeekCore", "LarkPeekTimeline"]
         ),
         .testTarget(
             name: "LarkPeekCoreTests",
             dependencies: ["LarkPeekCore"]
+        ),
+        .testTarget(
+            name: "LarkPeekTimelineTests",
+            dependencies: ["LarkPeekTimeline"]
         )
     ]
 )

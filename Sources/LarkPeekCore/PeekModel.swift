@@ -13,11 +13,6 @@ private struct StoredThreadResolution: Codable {
     let chat: LarkChat
 }
 
-private struct ThreadReplyTask {
-    let id: UUID
-    let task: Task<Void, Never>
-}
-
 public enum PeekState: Equatable {
     case waiting
     case loading(HoveredConversation)
@@ -32,18 +27,17 @@ public final class PeekModel: ObservableObject {
     @Published public private(set) var authStatus = AuthStatus()
     @Published public private(set) var cliPath: String?
     @Published public private(set) var statusMessage = "正在准备只读预览…"
-    @Published public private(set) var hasOlderMessages = false
-    @Published public private(set) var isLoadingOlderMessages = false
+    public let timeline = TimelineSession()
+    public var hasOlderMessages: Bool { timeline.pagination.cursor != nil }
+    public var isLoadingOlderMessages: Bool { timeline.pagination.isLoading }
     @Published public private(set) var diagnosticTriggerID: String?
 
     private var client: LarkCLIClient?
     private var recentChats: [LarkChat] = []
     private var nextPageToken: String?
-    private var messageNextPageToken: String?
     private var imageCache: [ImageRequest: Data] = [:]
     private var imageCacheOrder: [ImageRequest] = []
     private var imageCacheBytes = 0
-    private var threadReplyTasks: [String: ThreadReplyTask] = [:]
     private var activeThreadReplyRequestCount = 0
     private var pendingThreadReplyRequests: [CheckedContinuation<Void, Never>] = []
     private let defaults: UserDefaults
@@ -55,6 +49,11 @@ public final class PeekModel: ObservableObject {
         self.defaults = defaults
         self.workingDirectory = workingDirectory
         configureClient()
+        timeline.onChange = { [weak self] in
+            guard let self, let conversation = self.timeline.conversation,
+                  let chat = self.timeline.chat else { return }
+            self.state = .messages(conversation, chat, self.timeline.messages, Date())
+        }
     }
 
     public func start() async {
@@ -104,11 +103,16 @@ public final class PeekModel: ObservableObject {
     }
 
     public func peek(_ conversation: HoveredConversation) async {
-        cancelTransientRequests()
+        resetTimeline()
+        await timeline.schedule(key: "initial") { [weak self] in
+            await self?.performPeek(conversation)
+        }.value
+    }
+
+    private func performPeek(_ conversation: HoveredConversation) async {
         let trigger = LarkPeekDiagnostics.triggerID ?? "none"
         diagnosticTriggerID = trigger
-        resetMessagePagination()
-        state = .loading(conversation)
+        publishState(.loading(conversation))
         hoverRouteLogger.info(
             "event=peek_started trigger=\(trigger, privacy: .public) nodes=\(conversation.rowTexts.count)"
         )
@@ -169,14 +173,14 @@ public final class PeekModel: ObservableObject {
                     threadMatchLogger.info(
                         "event=fast_path_failed trigger=\(trigger, privacy: .public) query=\(hint.searchQuery, privacy: .private(mask: .hash)) code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)"
                     )
-                    state = .error(conversation, "话题检索失败，请稍后重试。")
+                    publishState(.error(conversation, "话题检索失败，请稍后重试。"))
                     return
                 }
 
                 // This row has the standalone-topic shape. Falling through to
                 // chat/contact matching can open an unrelated P2P conversation
                 // whose name happens to equal the topic author.
-                state = .error(conversation, "没有定位到这个话题，请稍后重试。")
+                publishState(.error(conversation, "没有定位到这个话题，请稍后重试。"))
                 return
             }
 
@@ -227,11 +231,11 @@ public final class PeekModel: ObservableObject {
 
             switch matches.count {
             case 0:
-                state = .error(conversation, "没有找到“\(conversation.name)”对应的已加入会话。")
+                publishState(.error(conversation, "没有找到“\(conversation.name)”对应的已加入会话。"))
             case 1:
                 try await loadMessages(for: matches[0], conversation: conversation, using: client)
             default:
-                state = .candidates(conversation, matches)
+                publishState(.candidates(conversation, matches))
             }
         } catch is CancellationError {
             hoverRouteLogger.info(
@@ -242,21 +246,29 @@ public final class PeekModel: ObservableObject {
             hoverRouteLogger.error(
                 "event=peek_failed trigger=\(trigger, privacy: .public) code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)"
             )
-            state = .error(conversation, error.localizedDescription)
+            publishState(.error(conversation, error.localizedDescription))
         }
     }
 
     public func select(_ chat: LarkChat, for conversation: HoveredConversation) async {
-        resetMessagePagination()
-        state = .loading(conversation)
-        remember(chatID: chat.id, for: conversation)
-        do {
-            try await loadMessages(for: chat, conversation: conversation, using: requireClient())
-        } catch is CancellationError {
-            return
-        } catch {
-            state = .error(conversation, error.localizedDescription)
-        }
+        resetTimeline()
+        await timeline.schedule(key: "initial") { [weak self] in
+            guard let self else { return }
+            self.publishState(.loading(conversation))
+            self.remember(chatID: chat.id, for: conversation)
+            do {
+                try await self.loadMessages(for: chat, conversation: conversation, using: self.requireClient())
+            } catch is CancellationError {
+                return
+            } catch {
+                self.publishState(.error(conversation, error.localizedDescription))
+            }
+        }.value
+    }
+
+    private func publishState(_ state: PeekState) {
+        if let id = TimelineRequestContext.sessionID, !timeline.isCurrent(id) { return }
+        self.state = state
     }
 
     public func retryCurrent() async {
@@ -272,96 +284,70 @@ public final class PeekModel: ObservableObject {
 
     public func dismiss() {
         cancelTransientRequests()
-        resetMessagePagination()
+        resetTimeline()
         diagnosticTriggerID = nil
         state = .waiting
     }
 
     public func presentError(_ message: String) {
         cancelTransientRequests()
-        resetMessagePagination()
-        state = .error(nil, message)
+        resetTimeline()
+        publishState(.error(nil, message))
     }
 
-    public func loadOlderMessages() async {
-        let trigger = LarkPeekDiagnostics.triggerID ?? diagnosticTriggerID ?? "none"
-        guard !isLoadingOlderMessages else {
-            peekModelLogger.debug(
-                "event=older_page_ignored trigger=\(trigger, privacy: .public) reason=already_loading"
-            )
-            return
-        }
-        guard let pageToken = messageNextPageToken else {
-            peekModelLogger.debug(
-                "event=older_page_ignored trigger=\(trigger, privacy: .public) reason=no_page_token"
-            )
-            return
-        }
-        guard case let .messages(conversation, chat, currentMessages, _) = state else {
-            peekModelLogger.debug(
-                "event=older_page_ignored trigger=\(trigger, privacy: .public) reason=timeline_not_visible"
-            )
-            return
-        }
+    public func loadOlderMessages(automatic: Bool = false) async {
+        await timeline.schedule(key: "older-page") { [weak self] in
+            await self?.performOlderPageLoad(automatic: automatic)
+        }.value
+    }
 
-        let startedAt = Date()
-        peekModelLogger.info(
-            "event=older_page_started trigger=\(trigger, privacy: .public) chat=\(chat.id, privacy: .private(mask: .hash)) token=\(pageToken, privacy: .private(mask: .hash)) current=\(currentMessages.count)"
-        )
-        isLoadingOlderMessages = true
-        defer { isLoadingOlderMessages = false }
+    private func performOlderPageLoad(automatic: Bool) async {
+        let sessionID = timeline.id
+        guard let chat = timeline.chat,
+              let request = timeline.beginPage(sessionID: sessionID, automatic: automatic) else { return }
+        var cursor = request.cursor
+        var visited = Set<String>()
         do {
             let client = try requireClient()
-            let result = try await client.run(
-                .recentMessages(chatID: chat.id, pageToken: pageToken, pageSize: 20)
-            )
-            let page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: chat.id)
-            try Task.checkCancellation()
-            guard case let .messages(_, visibleChat, _, _) = state,
-                  visibleChat.id == chat.id else {
-                peekModelLogger.debug(
-                    "event=older_page_discarded trigger=\(trigger, privacy: .public) reason=chat_changed"
-                )
-                return
+            for attempt in 0..<3 {
+                try timeline.checkCurrentRequest()
+                visited.insert(cursor)
+                let result = try await client.run(.recentMessages(chatID: chat.id, pageToken: cursor, pageSize: 20))
+                try timeline.checkCurrentRequest()
+                let page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: chat.id)
+                let knownIDs = Set(timeline.messages.map(\.id))
+                let addedCount = Set(page.messages.map(\.id)).subtracting(knownIDs).count
+                let nextState: TimelinePagination
+                if let next = page.nextPageToken {
+                    if visited.contains(next) || timeline.consumedPageTokens.contains(next) {
+                        nextState = .paused(nil, "分页游标没有前进，请重新打开预览")
+                    } else if addedCount > 0 {
+                        nextState = .ready(next)
+                    } else if attempt == 2 {
+                        nextState = .paused(next, "本次未读到更早消息")
+                    } else {
+                        nextState = .loading(request.id, next)
+                    }
+                } else {
+                    nextState = .exhausted
+                }
+                timeline.receivePage(page, requestID: request.id, sessionID: sessionID, nextState: nextState)
+                scheduleEnrichment(using: client)
+                peekModelLogger.info("event=older_page_received added=\(addedCount) total=\(self.timeline.messages.count) attempt=\(attempt + 1)")
+                guard case let .loading(_, next) = nextState else { return }
+                cursor = next
             }
-
-            if page.nextPageToken == pageToken {
-                peekModelLogger.error(
-                    "event=pagination_stopped trigger=\(trigger, privacy: .public) reason=repeated_token chat=\(chat.id, privacy: .private(mask: .hash))"
-                )
-                messageNextPageToken = nil
-                hasOlderMessages = false
-            } else {
-                messageNextPageToken = page.nextPageToken
-                hasOlderMessages = page.nextPageToken != nil
-            }
-            let mergedMessages = MessageTimeline.merging(page.messages, into: currentMessages)
-            let namedMessages = await resolveSharedChatNames(in: mergedMessages, using: client)
-            state = .messages(conversation, chat, namedMessages, Date())
-            let hydratedMessages = await downloadImages(in: namedMessages, using: client)
-            guard case let .messages(_, hydratedChat, _, _) = state,
-                  hydratedChat.id == chat.id else { return }
-            state = .messages(conversation, chat, hydratedMessages, Date())
-            let elapsedMilliseconds = Int(Date().timeIntervalSince(startedAt) * 1_000)
-            peekModelLogger.info(
-                "event=older_page_succeeded trigger=\(trigger, privacy: .public) chat=\(chat.id, privacy: .private(mask: .hash)) pageCount=\(page.messages.count) mergedCount=\(mergedMessages.count) hasMore=\(page.nextPageToken != nil) elapsedMs=\(elapsedMilliseconds)"
-            )
         } catch is CancellationError {
-            peekModelLogger.debug(
-                "event=older_page_cancelled trigger=\(trigger, privacy: .public) chat=\(chat.id, privacy: .private(mask: .hash))"
-            )
-            return
+            timeline.finishPage(.ready(cursor), requestID: request.id, sessionID: sessionID)
         } catch {
-            peekModelLogger.error(
-                "event=older_page_failed trigger=\(trigger, privacy: .public) chat=\(chat.id, privacy: .private(mask: .hash)) code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)"
-            )
-            statusMessage = "加载更早消息失败：\(error.localizedDescription)"
+            timeline.finishPage(.failed(cursor, error.localizedDescription), requestID: request.id, sessionID: sessionID)
+            peekModelLogger.error("event=older_page_failed code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public)")
         }
     }
 
     public func showPreviewFixture() {
         diagnosticTriggerID = "fixture"
-        resetMessagePagination()
+        resetTimeline()
         let conversation = HoveredConversation(
             name: "产品体验群",
             rowFrame: CGRect(x: 280, y: 220, width: 420, height: 62),
@@ -417,11 +403,12 @@ public final class PeekModel: ObservableObject {
                 ]
             )
         ]
-        state = .messages(conversation, chat, messages, now)
+        timeline.install(conversation: conversation, chat: chat, messages: messages, cursor: nil, sessionID: timeline.id)
         statusMessage = "视觉预览模式"
     }
 
     public func configureCLI(at url: URL?) async {
+        dismiss()
         if let url { defaults.set(url.path, forKey: "selectedLarkCLIPath") }
         else { defaults.removeObject(forKey: "selectedLarkCLIPath") }
         configureClient()
@@ -523,27 +510,13 @@ public final class PeekModel: ObservableObject {
         conversation: HoveredConversation,
         using client: LarkCLIClient
     ) async throws {
-        try Task.checkCancellation()
+        try timeline.checkCurrentRequest()
+        let sessionID = timeline.id
         let result = try await client.run(.recentMessages(chatID: chat.id, pageSize: 20))
+        try timeline.checkCurrentRequest()
         let page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: chat.id)
-        messageNextPageToken = page.nextPageToken
-        hasOlderMessages = page.nextPageToken != nil
-        let messages = page.messages
-            .sorted(by: LarkMessage.isChronologicallyBefore)
-        state = .messages(conversation, chat, messages, Date())
-        let namedMessages = await resolveSharedChatNames(in: messages, using: client)
-        try Task.checkCancellation()
-        guard case let .messages(_, namedChat, _, _) = state,
-              namedChat.id == chat.id else { return }
-        state = .messages(conversation, chat, namedMessages, Date())
-        let hydratedMessages = await downloadImages(in: namedMessages, using: client)
-        try Task.checkCancellation()
-        guard case let .messages(_, visibleChat, _, _) = state,
-              visibleChat.id == chat.id else { return }
-        state = .messages(conversation, chat, hydratedMessages, Date())
-        peekModelLogger.info(
-            "event=initial_messages_succeeded trigger=\(LarkPeekDiagnostics.triggerID ?? "none", privacy: .public) chat=\(chat.id, privacy: .private(mask: .hash)) count=\(messages.count) hasMore=\(page.nextPageToken != nil)"
-        )
+        timeline.install(conversation: conversation, chat: chat, messages: page.messages, cursor: page.nextPageToken, sessionID: sessionID)
+        scheduleEnrichment(using: client)
     }
 
     private func findThread(
@@ -692,35 +665,23 @@ public final class PeekModel: ObservableObject {
         conversation: HoveredConversation,
         using client: LarkCLIClient
     ) async throws {
-        let trigger = LarkPeekDiagnostics.triggerID ?? diagnosticTriggerID ?? "none"
+        try timeline.checkCurrentRequest()
+        let sessionID = timeline.id
         guard let threadID = root.threadID else { throw LarkCLIError.malformedResponse }
-        resetMessagePagination()
         var root = root
         root.threadRepliesLoaded = false
-        state = .messages(conversation, chat, [root], Date())
-
         let result = try await client.run(.threadMessages(threadID: threadID, pageSize: 50))
+        try timeline.checkCurrentRequest()
         let page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: chat.id)
-        try Task.checkCancellation()
         root.threadReplies = page.messages.sorted(by: LarkMessage.isChronologicallyBefore)
         root.threadRepliesLoaded = true
         root.threadHasMore = page.nextPageToken != nil
-        state = .messages(conversation, chat, [root], Date())
-
-        let hydrated = await downloadImages(in: [root], using: client)
-        try Task.checkCancellation()
-        guard case let .messages(_, visibleChat, _, _) = state,
-              visibleChat.id == chat.id else { return }
-        state = .messages(conversation, chat, hydrated, Date())
-        threadMatchLogger.info(
-            "event=thread_loaded trigger=\(trigger, privacy: .public) chat=\(chat.id, privacy: .private(mask: .hash)) replies=\(root.threadReplies.count) hasMore=\(page.nextPageToken != nil)"
-        )
+        timeline.install(conversation: conversation, chat: chat, messages: [root], cursor: nil, sessionID: sessionID)
+        scheduleEnrichment(using: client)
     }
 
-    private func resetMessagePagination() {
-        messageNextPageToken = nil
-        hasOlderMessages = false
-        isLoadingOlderMessages = false
+    private func resetTimeline() {
+        timeline.reset()
     }
 
     private struct ImageRequest: Hashable, Sendable {
@@ -775,82 +736,39 @@ public final class PeekModel: ObservableObject {
     }
 
     public func loadThreadReplies(for messageID: String) async {
-        guard case let .messages(_, _, messages, _) = state,
-              let root = messages.first(where: { $0.id == messageID }),
-              root.isThreadRoot,
-              let threadID = root.threadID,
-              !root.threadRepliesLoaded else { return }
-
-        if let existing = threadReplyTasks[threadID] {
-            await existing.task.value
-            return
-        }
-
-        let taskID = UUID()
-        let task = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer {
-                if self.threadReplyTasks[threadID]?.id == taskID {
-                    self.threadReplyTasks[threadID] = nil
-                }
-            }
-            await self.performThreadReplyLoad(threadID: threadID, chatID: root.chatID)
-        }
-        threadReplyTasks[threadID] = ThreadReplyTask(id: taskID, task: task)
-        await task.value
+        guard let root = timeline.messages.first(where: { $0.id == messageID }),
+              root.isThreadRoot, let threadID = root.threadID, !root.threadRepliesLoaded else { return }
+        await timeline.schedule(key: "thread:" + threadID) { [weak self] in
+            await self?.performThreadReplyLoad(threadID: threadID)
+        }.value
     }
 
     public func cancelTransientRequests() {
-        let tasks = threadReplyTasks.values.map(\.task)
-        threadReplyTasks.removeAll()
-        for task in tasks { task.cancel() }
+        timeline.invalidateRequests()
     }
 
-    private func performThreadReplyLoad(threadID: String, chatID: String) async {
-        let trigger = LarkPeekDiagnostics.triggerID ?? diagnosticTriggerID ?? "none"
+    /// Freeze the displayed snapshot during the close animation, but invalidate all writers now.
+    public func invalidatePreviewRequests() {
+        timeline.invalidateRequests()
+    }
+
+    private func performThreadReplyLoad(threadID: String) async {
+        let sessionID = timeline.id
+        timeline.beginReplies(threadID: threadID, sessionID: sessionID)
         await acquireThreadReplyRequestSlot()
         defer { releaseThreadReplyRequestSlot() }
         do {
-            try Task.checkCancellation()
+            try timeline.checkCurrentRequest()
             let client = try requireClient()
             let result = try await client.run(.threadMessages(threadID: threadID, pageSize: 50))
-            let page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: chatID)
-            try Task.checkCancellation()
-            guard case let .messages(conversation, chat, currentMessages, _) = state,
-                  chat.id == chatID else { return }
-
-            let replies = page.messages.sorted(by: LarkMessage.isChronologicallyBefore)
-            let updatedMessages = currentMessages.map { current -> LarkMessage in
-                guard current.isThreadRoot, current.threadID == threadID else { return current }
-                var current = current
-                current.threadReplies = replies
-                current.threadRepliesLoaded = true
-                current.threadHasMore = page.nextPageToken != nil
-                return current
-            }
-            state = .messages(conversation, chat, updatedMessages, Date())
-
-            let hydratedMessages = await downloadImages(in: updatedMessages, using: client)
-            try Task.checkCancellation()
-            guard case let .messages(_, visibleChat, visibleMessages, _) = state,
-                  visibleChat.id == chatID else { return }
-            state = .messages(
-                conversation,
-                chat,
-                MessageTimeline.merging(hydratedMessages, into: visibleMessages),
-                Date()
-            )
-            threadMatchLogger.info(
-                "event=lazy_thread_loaded trigger=\(trigger, privacy: .public) chat=\(chatID, privacy: .private(mask: .hash)) replies=\(replies.count) hasMore=\(page.nextPageToken != nil)"
-            )
+            try timeline.checkCurrentRequest()
+            let page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: timeline.chat?.id ?? "")
+            timeline.applyReplies(page.messages, threadID: threadID, hasMore: page.nextPageToken != nil, sessionID: sessionID)
+            scheduleEnrichment(using: client)
         } catch is CancellationError {
-            threadMatchLogger.info(
-                "event=lazy_thread_cancelled trigger=\(trigger, privacy: .public) chat=\(chatID, privacy: .private(mask: .hash))"
-            )
+            return
         } catch {
-            threadMatchLogger.error(
-                "event=lazy_thread_failed trigger=\(trigger, privacy: .public) chat=\(chatID, privacy: .private(mask: .hash)) code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)"
-            )
+            timeline.failReplies(threadID: threadID, error: error.localizedDescription, sessionID: sessionID)
         }
     }
 
@@ -872,111 +790,68 @@ public final class PeekModel: ObservableObject {
         }
     }
 
-    private func downloadImages(in messages: [LarkMessage], using client: LarkCLIClient) async -> [LarkMessage] {
-        let chatID = messages.first?.chatID
-        var hydratedMessages = applyingImageCache(to: messages)
-        if hydratedMessages != messages, let chatID {
-            publishImageProgress(hydratedMessages, forChatID: chatID)
-        }
-
-        // The timeline opens at the bottom, so prioritize the newest visible
-        // messages instead of making the initial viewport wait for old images.
-        let allMessages = hydratedMessages.reversed().flatMap { message in
-            [message] + message.threadReplies.reversed()
-        }
-        var seenRequests = Set<ImageRequest>()
-        let requests = allMessages.flatMap { message in
-            message.images.compactMap { image -> ImageRequest? in
-                guard image.data == nil, !image.attempted else { return nil }
-                let request = ImageRequest(messageID: message.id, key: image.key)
-                return seenRequests.insert(request).inserted ? request : nil
+    private func scheduleEnrichment(using client: LarkCLIClient) {
+        timeline.schedule(key: "names") { [weak self] in
+            guard let self else { return }
+            let sessionID = self.timeline.id
+            var attempted = Set<String>()
+            while self.timeline.isCurrent(sessionID), !Task.isCancelled {
+                let unresolved = self.timeline.messages.flatMap { [$0] + $0.threadReplies }.filter {
+                    guard let id = $0.sharedChatID else { return false }
+                    return $0.sharedChatName == nil && !attempted.contains(id)
+                }
+                guard !unresolved.isEmpty else { return }
+                attempted.formUnion(unresolved.compactMap(\.sharedChatID))
+                let resolved = await self.resolveSharedChatNames(in: unresolved, using: client)
+                guard self.timeline.isCurrent(sessionID), !Task.isCancelled else { return }
+                let names = resolved.reduce(into: [String: String]()) { result, message in
+                    if let id = message.sharedChatID, let name = message.sharedChatName { result[id] = name }
+                }
+                self.timeline.applyNames(names, sessionID: sessionID)
             }
         }
-        guard !requests.isEmpty else { return hydratedMessages }
+        // One resource worker per session caps all overlapping page/reply downloads at three.
+        timeline.schedule(key: "images") { [weak self] in
+            await self?.hydrateImages(using: client)
+        }
+    }
 
-        let workingDirectory = self.workingDirectory
-        await withTaskGroup(of: (ImageRequest, ImageDownload).self) { group in
-            var nextRequestIndex = 0
-
-            while nextRequestIndex < min(3, requests.count) {
-                let request = requests[nextRequestIndex]
-                nextRequestIndex += 1
-                group.addTask {
-                    let data = await Self.downloadImage(
-                        request,
-                        using: client,
-                        workingDirectory: workingDirectory
-                    )
-                    return (request, ImageDownload(data: data))
+    private func hydrateImages(using client: LarkCLIClient) async {
+        let sessionID = timeline.id
+        while timeline.isCurrent(sessionID), !Task.isCancelled {
+            let allMessages = timeline.messages.reversed().flatMap { [$0] + $0.threadReplies.reversed() }
+            var seen = Set<ImageRequest>()
+            let pending = allMessages.flatMap { message in
+                message.images.compactMap { image -> ImageRequest? in
+                    guard image.data == nil, !image.attempted else { return nil }
+                    let request = ImageRequest(messageID: message.id, key: image.key)
+                    return seen.insert(request).inserted ? request : nil
                 }
             }
-
-            while let (request, download) = await group.next() {
-                guard !Task.isCancelled else {
-                    group.cancelAll()
-                    return
-                }
-                if let data = download.data {
-                    cacheImage(data, for: request)
-                }
-                hydratedMessages = applying([request: download], to: hydratedMessages)
-                if let chatID {
-                    publishImageProgress(hydratedMessages, forChatID: chatID)
-                }
-
-                if nextRequestIndex < requests.count {
-                    let request = requests[nextRequestIndex]
-                    nextRequestIndex += 1
-                    group.addTask {
-                        let data = await Self.downloadImage(
-                            request,
-                            using: client,
-                            workingDirectory: workingDirectory
-                        )
-                        return (request, ImageDownload(data: data))
+            guard !pending.isEmpty else { return }
+            let batch = Array(pending.prefix(3))
+            let workingDirectory = self.workingDirectory
+            await withTaskGroup(of: (ImageRequest, ImageDownload).self) { group in
+                for request in batch {
+                    if let cached = imageCache[request] {
+                        timeline.applyImage(messageID: request.messageID, key: request.key, data: cached, sessionID: sessionID)
+                    } else {
+                        group.addTask {
+                            let data = await Self.downloadImage(request, using: client, workingDirectory: workingDirectory)
+                            return (request, ImageDownload(data: data))
+                        }
                     }
                 }
+                while let (request, result) = await group.next() {
+                    guard timeline.isCurrent(sessionID), !Task.isCancelled else {
+                        group.cancelAll()
+                        return
+                    }
+                    if let data = result.data { cacheImage(data, for: request) }
+                    timeline.applyImage(messageID: request.messageID, key: request.key, data: result.data, sessionID: sessionID)
+                }
             }
         }
-
-        return hydratedMessages
-    }
-
-    private func applying(
-        _ downloaded: [ImageRequest: ImageDownload],
-        to messages: [LarkMessage]
-    ) -> [LarkMessage] {
-        return messages.map { message in
-            var message = message
-            message = applying(downloaded, to: message)
-            message.threadReplies = message.threadReplies.map { applying(downloaded, to: $0) }
-            return message
-        }
-    }
-
-    private func applyingImageCache(to messages: [LarkMessage]) -> [LarkMessage] {
-        messages.map { message in
-            var message = applyingImageCache(to: message)
-            message.threadReplies = message.threadReplies.map { applyingImageCache(to: $0) }
-            return message
-        }
-    }
-
-    private func applyingImageCache(to message: LarkMessage) -> LarkMessage {
-        var message = message
-        message.images = message.images.map { image in
-            guard image.data == nil,
-                  let data = imageCache[ImageRequest(messageID: message.id, key: image.key)]
-            else { return image }
-            return MessageImage(key: image.key, data: data, attempted: true)
-        }
-        return message
-    }
-
-    private func publishImageProgress(_ messages: [LarkMessage], forChatID chatID: String) {
-        guard case let .messages(conversation, chat, _, _) = state,
-              chat.id == chatID else { return }
-        state = .messages(conversation, chat, messages, Date())
     }
 
     private func cacheImage(_ data: Data, for request: ImageRequest) {
@@ -1000,16 +875,6 @@ public final class PeekModel: ObservableObject {
         imageCache.removeAll(keepingCapacity: false)
         imageCacheOrder.removeAll(keepingCapacity: false)
         imageCacheBytes = 0
-    }
-
-    private func applying(_ downloaded: [ImageRequest: ImageDownload], to message: LarkMessage) -> LarkMessage {
-        var message = message
-        message.images = message.images.map { image in
-            let request = ImageRequest(messageID: message.id, key: image.key)
-            guard let result = downloaded[request] else { return image }
-            return MessageImage(key: image.key, data: result.data, attempted: true)
-        }
-        return message
     }
 
     private nonisolated static func downloadImage(
