@@ -283,6 +283,7 @@ private struct MessageBodyView: View {
                             )
                         }
                     )
+                    .modifier(ImageWindowActivationEvents())
                     .contentShape(RoundedRectangle(cornerRadius: 9))
                     .help("点击查看大图")
                     .accessibilityElement(children: .ignore)
@@ -335,6 +336,17 @@ private struct MessageBodyView: View {
             senderName: message.sender.name,
             sourceFrame: sourceFrame
         ))
+    }
+}
+
+private struct ImageWindowActivationEvents: ViewModifier {
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(macOS 15.0, *) {
+            content.allowsWindowActivationEvents(true)
+        } else {
+            content
+        }
     }
 }
 
