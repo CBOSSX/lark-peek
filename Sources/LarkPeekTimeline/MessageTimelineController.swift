@@ -22,6 +22,9 @@ public final class MessageTimelineController: NSViewController, NSCollectionView
     private var appliedInteractionRevision = 0
     private var initialPosition: TimelineReadingPosition?
     private var keepBottomUntilInteraction = false
+    private var presentationProtected = false
+    private var presentationPosition: TimelineReadingPosition?
+    private var presentationInterrupted = false
     private var heightTransition: TimelineHeightTransition?
     private var heightAnimationTask: Task<Void, Never>?
     var reduceMotionOverride: Bool?
@@ -61,6 +64,8 @@ public final class MessageTimelineController: NSViewController, NSCollectionView
         scrollView.contentView.postsBoundsChangedNotifications = true
         NotificationCenter.default.addObserver(self, selector: #selector(boundsChanged), name: NSView.boundsDidChangeNotification, object: scrollView.contentView)
         scrollView.onUserInput = { [weak self] in
+            self?.presentationInterrupted = true
+            self?.presentationProtected = false
             self?.keepBottomUntilInteraction = false
             self?.finishExpansionForUserInput()
         }
@@ -77,7 +82,13 @@ public final class MessageTimelineController: NSViewController, NSCollectionView
     }
 
     public func update(sessionID: UUID, rows: [TimelineRow], interactionAnchor: String? = nil, interactionRevision: Int = 0,
-                       initialPosition: TimelineReadingPosition? = nil) {
+                       initialPosition: TimelineReadingPosition? = nil, isPresenting: Bool = false) {
+        if requestedSessionID != sessionID {
+            presentationInterrupted = false
+            presentationPosition = initialPosition
+        }
+        let finishingPresentation = presentationProtected && !isPresenting
+        presentationProtected = !presentationInterrupted && (isPresenting || finishingPresentation)
         requestedSessionID = sessionID
         requestedRows = rows
         self.interactionAnchor = interactionAnchor
@@ -85,11 +96,17 @@ public final class MessageTimelineController: NSViewController, NSCollectionView
         self.initialPosition = initialPosition
         loadViewIfNeeded()
         applyPendingRows()
+        if presentationProtected { restorePresentationPosition() }
+        if finishingPresentation {
+            presentationProtected = false
+            saveReadingPosition()
+        }
     }
 
     public override func viewDidLayout() {
         super.viewDidLayout()
         applyPendingRows()
+        if presentationProtected { restorePresentationPosition() }
     }
 
     public override func viewWillDisappear() {
@@ -174,6 +191,9 @@ public final class MessageTimelineController: NSViewController, NSCollectionView
         } else if let anchor, let index = newIDs.firstIndex(of: anchor.id) {
             targetY = timelineLayout.frames[index].minY - anchor.screenY
         }
+        if presentationProtected {
+            targetY = presentationTargetY()
+        }
         targetY = max(0, min(targetY, timelineLayout.collectionViewContentSize.height - viewportHeight))
         timelineLayout.updateOrigin = CGPoint(x: 0, y: targetY)
         let oldRows = rows
@@ -229,7 +249,7 @@ public final class MessageTimelineController: NSViewController, NSCollectionView
         CATransaction.commit()
         heights = heights.filter { newIDSet.contains($0.key) }
         let error = scrollView.contentView.bounds.minY - targetY
-        LarkPeekDiagnostics.messageTimeline.info("event=layout_committed rows=\(newRows.count) prepend=\(isPrepend) offsetError=\(Double(error))")
+        LarkPeekDiagnostics.messageTimeline.info("event=layout_committed session=\(requestedSessionID.uuidString, privacy: .public) rows=\(newRows.count) prepend=\(isPrepend) offsetError=\(Double(error))")
         saveReadingPosition()
         if let heightTransition { startHeightAnimation(id: heightTransition.id) }
     }
@@ -299,10 +319,35 @@ public final class MessageTimelineController: NSViewController, NSCollectionView
 
     @objc private func boundsChanged() {
         guard !applying else { return }
+        if presentationProtected {
+            // Presentation is composited by the panel layer; never remeasure rows per animation frame.
+            restorePresentationPosition()
+            return
+        }
         saveReadingPosition()
     }
 
+    private func presentationTargetY() -> CGFloat {
+        let maximum = max(0, timelineLayout.collectionViewContentSize.height - scrollView.contentView.bounds.height)
+        if let position = presentationPosition, !position.isAtBottom,
+           let index = requestedRows.firstIndex(where: { $0.id == position.messageID }),
+           timelineLayout.frames.indices.contains(index) {
+            return max(0, min(maximum, timelineLayout.frames[index].minY - position.screenY))
+        }
+        return maximum
+    }
+
+    private func restorePresentationPosition() {
+        guard !applying, sessionID == requestedSessionID, !rows.isEmpty else { return }
+        applying = true
+        defer { applying = false }
+        let target = presentationTargetY()
+        scrollView.contentView.scroll(to: CGPoint(x: 0, y: target))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
     private func saveReadingPosition() {
+        guard !presentationProtected else { return }
         let origin = scrollView.contentView.bounds.minY
         guard let index = timelineLayout.frames.indices.first(where: {
             $0 < rows.count && timelineLayout.frames[$0].maxY > origin && !rows[$0].id.hasPrefix("timeline-")

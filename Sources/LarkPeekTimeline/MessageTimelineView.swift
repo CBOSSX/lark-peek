@@ -27,8 +27,8 @@ public struct MessageTimelineView: View {
     public var body: some View {
         let revision = model.timeline.revision
         return NativeMessageTimeline(sessionID: sessionID, rows: timelineRows, interactionAnchor: interactionAnchor, interactionRevision: interactionRevision,
-            initialPosition: readingState.position, onPositionChange: {
-                guard model.timeline.id == sessionID else { return }
+            initialPosition: readingState.position, isPresenting: model.isPresentingPreview, onPositionChange: {
+                guard model.timeline.isCurrent(sessionID) else { return }
                 readingState.position = $0
             }, onLoadNewer: {
                 Task {

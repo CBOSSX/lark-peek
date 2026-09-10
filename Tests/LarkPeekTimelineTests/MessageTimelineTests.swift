@@ -120,6 +120,31 @@ struct MessageTimelineTests {
         CGImageDestinationAddImage(destination, image, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: delay]] as CFDictionary)
     }
 
+    @Test func presentationProtectsTheOriginalAnchorUntilCompletionOrUserInput() throws {
+        let fixture = WindowFixture()
+        defer { fixture.close() }
+        let saved = TimelineReadingPosition(messageID: "message-6", screenY: -21, isAtBottom: false)
+        var written: TimelineReadingPosition?
+        fixture.controller.onPositionChange = { written = $0 }
+        fixture.controller.update(sessionID: fixture.id, rows: rows(0..<20), initialPosition: saved, isPresenting: true)
+        fixture.layout()
+        fixture.scroll(to: 900)
+        #expect(abs(fixture.screenY(at: 6) - saved.screenY) <= 0.5)
+        #expect(written == nil)
+        fixture.controller.update(sessionID: fixture.id, rows: rows(0..<20), initialPosition: saved, isPresenting: false)
+        #expect(written?.messageID == saved.messageID)
+        #expect(abs(try #require(written).screenY - saved.screenY) <= 0.5)
+
+        let next = UUID()
+        fixture.controller.update(sessionID: next, rows: rows(0..<20), initialPosition: saved, isPresenting: true)
+        fixture.controller.scrollView.onUserInput?()
+        fixture.scroll(to: 900)
+        let userPosition = try #require(written)
+        fixture.controller.update(sessionID: next, rows: rows(0..<20), initialPosition: saved, isPresenting: false)
+        #expect(written == userPosition)
+        #expect(abs(fixture.controller.scrollView.contentView.bounds.minY - 900) <= 0.5)
+    }
+
     @Test func cachedConversationRestoresItsOwnAnchorAndExpansionGeometry() throws {
         let fixture = WindowFixture()
         defer { fixture.close() }

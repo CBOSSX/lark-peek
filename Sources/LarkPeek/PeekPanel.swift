@@ -112,9 +112,11 @@ final class PeekPanelController {
         // animation room to render), so the hosting view must not clamp it to the
         // SwiftUI ideal size.
         hostingView.sizingOptions = []
+        hostingView.wantsLayer = true
         panel.contentView = hostingView
     }
 
+    var window: NSWindow { panel }
     var isVisible: Bool { panel.isVisible }
     var isPinned: Bool { presentation.isPinned }
     var isSearching: Bool { presentation.isSearching }
@@ -124,8 +126,10 @@ final class PeekPanelController {
 
     private var lastCardFrame: CGRect = .zero
     private var lastTriggerID: String?
+    private var presentationGeneration = UUID()
+    private var presentationCursorInLayer = CGPoint.zero
 
-    func show(anchor axFrame: CGRect, triggerID: String, preservePosition: Bool = false) {
+    func show(anchor axFrame: CGRect, triggerID: String, preservePosition: Bool = false, cursorLocation: CGPoint? = nil) {
         dismissPresentedImage()
         closeTask?.cancel()
         closeTask = nil
@@ -142,36 +146,135 @@ final class PeekPanelController {
         presentation.isPinned = false
         let cardFrame = CGRect(origin: origin(for: axFrame, panelSize: Self.cardSize), size: Self.cardSize)
         lastCardFrame = cardFrame
-        let anchor = cursorPoint(NSEvent.mouseLocation, relativeTo: cardFrame)
+        let anchor = cursorPoint(cursorLocation ?? NSEvent.mouseLocation, relativeTo: cardFrame)
         presentation.appearAnchor = anchor
         // The window always covers the card's whole flight path from the cursor,
         // so the animation is never clipped at the window edge. The extra area is
         // transparent and click-through.
         let flight = flightFrame(cardFrame: cardFrame, anchor: anchor)
+        if !panel.isVisible, let layer = panel.contentView?.layer {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.transform = CATransform3DIdentity
+            CATransaction.commit()
+        }
         panel.setFrame(flight, display: false)
         presentation.cardOffset = cardOffset(of: cardFrame, within: flight)
         updateInteractiveRect()
+        if !panel.isVisible, let view = panel.contentView {
+            let cursor = NSPoint(x: cardFrame.minX + anchor.x * cardFrame.width,
+                                 y: cardFrame.minY + (1 - anchor.y) * cardFrame.height)
+            presentationCursorInLayer = view.convertToLayer(view.convert(panel.convertPoint(fromScreen: cursor), from: nil))
+        }
         LarkPeekDiagnostics.panel.info(
             "event=show_requested trigger=\(triggerID, privacy: .public) alreadyVisible=\(self.panel.isVisible) cardWidth=\(cardFrame.width, format: .fixed(precision: 0)) cardHeight=\(cardFrame.height, format: .fixed(precision: 0)) flightWidth=\(flight.width, format: .fixed(precision: 0)) flightHeight=\(flight.height, format: .fixed(precision: 0))"
         )
         if panel.isVisible {
-            presentation.isPresented = true
+            if !presentation.isPresented {
+                presentationGeneration = UUID()
+                model.isPresentingPreview = true
+                animatePresentation(generation: presentationGeneration)
+            }
             LarkPeekDiagnostics.panel.notice(
                 "event=show_completed trigger=\(triggerID, privacy: .public) visible=\(self.panel.isVisible) reused=true"
             )
             return
+        }
+        presentationGeneration = UUID()
+        let generation = presentationGeneration
+        model.isPresentingPreview = true
+        if let layer = panel.contentView?.layer {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.opacity = 0
+            layer.transform = presentationTransform()
+            CATransaction.commit()
         }
         panel.orderFrontRegardless()
         LarkPeekDiagnostics.panel.notice(
             "event=window_ordered_front trigger=\(triggerID, privacy: .public) visible=\(self.panel.isVisible)"
         )
         // Let the hidden state render for one pass so the fly-in animation plays.
-        DispatchQueue.main.async { [presentation] in
-            presentation.isPresented = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.presentationGeneration == generation, self.closeTask == nil else { return }
+            self.animatePresentation(generation: generation)
             LarkPeekDiagnostics.panel.notice(
                 "event=show_completed trigger=\(triggerID, privacy: .public) visible=\(self.panel.isVisible) reused=false"
             )
         }
+    }
+
+    func presentationTransform() -> CATransform3D {
+        guard let view = panel.contentView, let layer = view.layer else { return CATransform3DIdentity }
+        var point = presentationCursorInLayer
+        // CALayer applies geometry flipping before its anchor-relative transform.
+        if layer.isGeometryFlipped {
+            point.y = layer.bounds.minY + layer.bounds.maxY - point.y
+        }
+        // AppKit backing layers need not have a centered anchor, and layer/view Y axes can differ.
+        let pivot = CGPoint(x: layer.bounds.minX + layer.anchorPoint.x * layer.bounds.width,
+                            y: layer.bounds.minY + layer.anchorPoint.y * layer.bounds.height)
+        var transform = CATransform3DMakeScale(0.2, 0.2, 1)
+        transform.m41 = (point.x - pivot.x) * 0.8
+        transform.m42 = (point.y - pivot.y) * 0.8
+        return transform
+    }
+
+    private func animatePresentation(generation: UUID) {
+        presentation.isPresented = true
+        animatePresentationLayer(show: true) { [weak self] in
+            guard let self, self.presentationGeneration == generation, self.closeTask == nil else { return }
+            self.model.isPresentingPreview = false
+        }
+    }
+
+    /// Animate composited pixels without changing the native scroll view's bounds or measurement environment.
+    private func animatePresentationLayer(show: Bool, completion: (@MainActor () -> Void)? = nil) {
+        guard let layer = panel.contentView?.layer else { completion?(); return }
+        let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let fromTransform = layer.presentation()?.transform ?? layer.transform
+        let fromOpacity = layer.presentation()?.opacity ?? layer.opacity
+        let targetTransform = show || reduced ? CATransform3DIdentity : presentationTransform()
+        let timing: CABasicAnimation
+        if show && !reduced {
+            // Match the original SwiftUI spring(response: 0.34, dampingFraction: 0.78).
+            let spring = CASpringAnimation()
+            let angularFrequency = 2 * Double.pi / 0.34
+            spring.mass = 1
+            spring.stiffness = angularFrequency * angularFrequency
+            spring.damping = 2 * 0.78 * angularFrequency
+            spring.initialVelocity = 0
+            spring.duration = spring.settlingDuration
+            spring.timingFunction = CAMediaTimingFunction(name: .linear)
+            timing = spring
+        } else {
+            timing = CABasicAnimation()
+            timing.duration = reduced ? 0.12 : 0.18
+            timing.timingFunction = CAMediaTimingFunction(name: show ? .easeOut : .easeIn)
+        }
+        layer.removeAnimation(forKey: "peek-presentation")
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock {
+            Task { @MainActor in completion?() }
+        }
+        layer.transform = targetTransform
+        layer.opacity = show ? 1 : 0
+        // Copy one timing definition so size and opacity always advance together.
+        let transform = timing.copy() as! CABasicAnimation
+        transform.keyPath = "transform"
+        transform.fromValue = NSValue(caTransform3D: reduced ? CATransform3DIdentity : fromTransform)
+        transform.toValue = NSValue(caTransform3D: targetTransform)
+        let opacity = timing.copy() as! CABasicAnimation
+        opacity.keyPath = "opacity"
+        opacity.fromValue = fromOpacity
+        opacity.toValue = show ? 1 : 0
+        let group = CAAnimationGroup()
+        group.animations = [transform, opacity]
+        group.duration = timing.duration
+        group.timingFunction = CAMediaTimingFunction(name: .linear)
+        layer.add(group, forKey: "peek-presentation")
+        CATransaction.commit()
     }
 
     func showPreviewFixture(anchor: CGRect) {
@@ -204,7 +307,9 @@ final class PeekPanelController {
         )
         // The window already covers the flight path, so the fly-out can start
         // immediately — no re-framing, no jump.
+        presentationGeneration = UUID()
         presentation.isPresented = false
+        animatePresentationLayer(show: false)
         presentation.isPinned = false
         closeTask = Task { @MainActor [weak self] in
             // Wait for the fly-out animation before removing the window.
@@ -213,6 +318,7 @@ final class PeekPanelController {
             self.panel.orderOut(nil)
             self.presentation.cardOffset = .zero
             self.model.dismiss()
+            self.model.isPresentingPreview = false
             self.search.clear()
             self.presentation.searchSessionID = nil
             self.presentation.searchOrigin = nil
@@ -401,10 +507,7 @@ private struct PeekPanelView: View {
             ZStack {
                 content
                     .id(stateKey)
-                    .transition(.asymmetric(
-                        insertion: .opacity.combined(with: .offset(y: reduceMotion ? 0 : 8)),
-                        removal: .opacity.combined(with: .offset(y: reduceMotion ? 0 : -6))
-                    ))
+                    .transition(.opacity)
                     .opacity(presentation.isSearching ? 0 : 1)
                     .offset(x: presentation.isSearching && !reduceMotion ? -24 : 0)
                     .allowsHitTesting(!presentation.isSearching)
@@ -441,17 +544,6 @@ private struct PeekPanelView: View {
             )
         }
         .shadow(color: .black.opacity(0.30), radius: 12, y: 5)
-        // Presentation modifiers apply to the card itself (before the transparent
-        // padding is added) so the scale anchor maps exactly to card coordinates.
-        .scaleEffect(presentation.isPresented ? 1 : 0.2, anchor: presentation.appearAnchor)
-        .opacity(presentation.isPresented ? 1 : 0)
-        .blur(radius: presentation.isPresented ? 0 : 14)
-        .animation(
-            presentation.isPresented
-                ? .spring(response: 0.34, dampingFraction: 0.78)
-                : .easeIn(duration: 0.18),
-            value: presentation.isPresented
-        )
         .padding(PeekPanelController.cardPadding)
         // Positions the card inside the enlarged in-flight window. Kept outside
         // the animation modifier so window re-framing never animates.

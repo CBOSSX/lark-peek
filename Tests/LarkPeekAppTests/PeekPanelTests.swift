@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 import SwiftUI
 import Testing
 import LarkPeekCore
@@ -8,6 +9,41 @@ import UniformTypeIdentifiers
 
 @Suite(.serialized) @MainActor
 struct PeekPanelTests {
+    @Test func presentationScaleKeepsTheMouseStationaryWithTheActualHostingLayerAnchor() async throws {
+        _ = NSApplication.shared
+        let model = PeekModel()
+        let controller = PeekPanelController(model: model)
+        let cursor = CGPoint(x: 150, y: 500)
+        model.showPreviewFixture()
+        controller.show(anchor: CGRect(x: 50, y: 100, width: 300, height: 60), triggerID: "pivot-test", cursorLocation: cursor)
+        let window = controller.window
+        let host = try #require(window.contentView)
+        host.layoutSubtreeIfNeeded()
+        let layer = try #require(host.layer)
+        layer.transform = CATransform3DIdentity
+        let localCursor = host.convertToLayer(host.convert(window.convertPoint(fromScreen: cursor), from: nil))
+        // Let Core Animation perform the actual transform around AppKit's backing-layer anchor.
+        let parent = CALayer()
+        let probe = CALayer()
+        probe.bounds = layer.bounds
+        probe.position = layer.position
+        probe.anchorPoint = layer.anchorPoint
+        probe.isGeometryFlipped = layer.isGeometryFlipped
+        parent.addSublayer(probe)
+        let before = probe.convert(localCursor, to: parent)
+        probe.transform = controller.presentationTransform()
+        let after = probe.convert(localCursor, to: parent)
+        #expect(abs(after.x - before.x) <= 0.01)
+        #expect(abs(after.y - before.y) <= 0.01)
+        // The card must be exactly one fifth its size around that fixed point.
+        let corner = CGPoint(x: localCursor.x + 100, y: localCursor.y + 150)
+        let scaled = probe.convert(corner, to: parent)
+        #expect(abs(abs(scaled.x - after.x) - 20) <= 0.01)
+        #expect(abs(abs(scaled.y - after.y) - 30) <= 0.01)
+        controller.close()
+        try await Task.sleep(for: .milliseconds(300))
+    }
+
     @Test func fastCachedReturnRestoresReadingPositionInTheActualPanel() async throws {
         _ = NSApplication.shared
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("PeekPanelCache-\(UUID())")
@@ -42,7 +78,7 @@ struct PeekPanelTests {
         let model = PeekModel(defaults: defaults, workingDirectory: directory)
         let controller = PeekPanelController(model: model)
         controller.show(anchor: CGRect(x: 50, y: 100, width: 300, height: 60), triggerID: "cache-test")
-        let window = try #require(NSApp.windows.first { $0.title == "Lark Peek" && $0.isVisible })
+        let window = controller.window
         func layout() async {
             for _ in 0..<8 {
                 window.contentView?.layoutSubtreeIfNeeded()
@@ -58,6 +94,11 @@ struct PeekPanelTests {
         let b = HoveredConversation(name: "乙群", rowFrame: .zero, rowTexts: ["乙群"])
         await model.peek(a)
         await layout()
+        for _ in 0..<100 where model.isPresentingPreview {
+            try await Task.sleep(for: .milliseconds(10))
+            await layout()
+        }
+        #expect(!model.isPresentingPreview)
         let host = try #require(window.contentView)
         let scroll = try #require(collection(in: host)?.enclosingScrollView)
         scroll.contentView.scroll(to: CGPoint(x: 0, y: 340))
@@ -97,6 +138,47 @@ struct PeekPanelTests {
         let restored = try #require(model.readingState.position)
         #expect(restored.messageID == saved.messageID)
         #expect(abs(restored.screenY - saved.screenY) <= 1)
+        // Exercise actual fly-out/fly-in, including the cached bottom flag.
+        for atBottom in [false, true] {
+            let currentScroll = try #require(collection(in: host)?.enclosingScrollView)
+            let bottomY = max(0, (currentScroll.documentView?.frame.height ?? 0) - currentScroll.contentView.bounds.height)
+            currentScroll.contentView.scroll(to: CGPoint(x: 0, y: atBottom ? bottomY : 340))
+            currentScroll.reflectScrolledClipView(currentScroll.contentView)
+            let original = try #require(model.readingState.position)
+            #expect(original.isAtBottom == atBottom)
+            for _ in 0..<3 {
+                let beforeClose = model.readingState.position
+                controller.close()
+                try await Task.sleep(for: .milliseconds(300))
+                #expect(model.readingState.position == beforeClose, "Closing animation cannot rewrite the cached anchor")
+                controller.show(anchor: CGRect(x: 50, y: 100, width: 300, height: 60), triggerID: "reopen-test")
+                await model.peek(a)
+                var openingBounds: CGRect?
+                for _ in 0..<150 {
+                    await layout()
+                    if let bounds = collection(in: host)?.enclosingScrollView?.contentView.bounds {
+                        if let openingBounds {
+                            #expect(abs(bounds.width - openingBounds.width) <= 0.01)
+                            #expect(abs(bounds.height - openingBounds.height) <= 0.01)
+                            #expect(abs(bounds.minY - openingBounds.minY) <= 0.5)
+                        } else {
+                            openingBounds = bounds
+                        }
+                    }
+                    if !model.isPresentingPreview { break }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                #expect(!model.isPresentingPreview)
+                try await Task.sleep(for: .milliseconds(80))
+                await layout()
+                let reopened = try #require(model.readingState.position)
+                #expect(reopened.isAtBottom == original.isAtBottom)
+                if !atBottom {
+                    #expect(reopened.messageID == original.messageID)
+                    #expect(abs(reopened.screenY - original.screenY) <= 0.5)
+                }
+            }
+        }
         controller.close()
         try await Task.sleep(for: .milliseconds(300))
     }
@@ -128,7 +210,7 @@ struct PeekPanelTests {
             await Task.yield()
         }
         #expect(search.hits.count == 1)
-        let window = try #require(NSApp.windows.first { $0.title == "Lark Peek" && $0.isVisible })
+        let window = controller.window
         let host = try #require(window.contentView)
         for _ in 0..<6 {
             host.layoutSubtreeIfNeeded()
@@ -215,7 +297,7 @@ struct PeekPanelTests {
         try await Task.sleep(for: .milliseconds(100))
         guard case .loading = model.state else { Issue.record("Context should stay loading until both sides arrive"); return }
         #expect(model.timeline.messages.isEmpty)
-        let window = try #require(NSApp.windows.first { $0.title == "Lark Peek" && $0.isVisible })
+        let window = controller.window
         let host = try #require(window.contentView)
         let destination = try #require(CGImageDestinationCreateWithURL(
             URL(fileURLWithPath: "/tmp/lark-peek-search-context.gif") as CFURL, UTType.gif.identifier as CFString, 10, nil))
@@ -305,7 +387,7 @@ struct PeekPanelTests {
         #expect(controller.frame == initialFrame)
         #expect(model.timeline.id == sessionID)
         #expect(controller.contains(CGPoint(x: initialFrame.midX, y: initialFrame.midY)))
-        let window = try #require(NSApp.windows.first { $0.title == "Lark Peek" && $0.isVisible })
+        let window = controller.window
         #expect(!window.styleMask.contains(.resizable))
         #expect(model.timeline.id == sessionID)
         for _ in 0..<6 {

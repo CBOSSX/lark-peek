@@ -59,7 +59,7 @@ extension PeekPanelTests {
         let controller = PeekPanelController(model: model)
         controller.show(anchor: CGRect(x: 80, y: 120, width: 350, height: 60), triggerID: "thread-choice-test")
         defer { controller.close() }
-        let window = try #require(NSApp.windows.first { $0.title == "Lark Peek" && $0.isVisible })
+        let window = controller.window
         for _ in 0..<8 {
             window.contentView?.layoutSubtreeIfNeeded()
             window.displayIfNeeded()

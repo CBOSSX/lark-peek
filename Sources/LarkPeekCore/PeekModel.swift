@@ -22,6 +22,7 @@ public final class PeekModel: ObservableObject {
     @Published public private(set) var authStatus = AuthStatus()
     @Published public private(set) var cliPath: String?
     @Published public private(set) var statusMessage = "正在准备只读预览…"
+    @Published public var isPresentingPreview = false
     public let timeline = TimelineSession()
     public var hasOlderMessages: Bool { timeline.pagination.cursor != nil }
     public var isLoadingOlderMessages: Bool { timeline.pagination.isLoading }
