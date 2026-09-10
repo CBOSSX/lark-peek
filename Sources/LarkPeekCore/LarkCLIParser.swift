@@ -91,6 +91,33 @@ public enum LarkCLIParser {
         try chatPage(from: data).chats
     }
 
+    public static func messageSearchPage(from data: Data, knownChats: [String: LarkChat] = [:]) throws -> MessageSearchPage {
+        let root = try payload(from: data)
+        guard let rows = root["messages"] as? [[String: Any]] else { throw LarkCLIError.malformedResponse }
+        let hits = rows.compactMap { row -> MessageSearchHit? in
+            guard let rawID = row["chat_id"] as? String, let chatID = validChatID(rawID),
+                  let message = parseMessage(row, fallbackChatID: chatID) else { return nil }
+            let knownChat = knownChats[chatID]
+            let kind = (row["chat_type"] as? String).map { ChatKind(chatMode: $0) } ?? knownChat?.kind ?? .group
+            func displayName(_ value: String?) -> String? {
+                guard let name = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !name.isEmpty, name != "未命名会话", name != "未命名群聊" else { return nil }
+                return name
+            }
+            let partner = row["chat_partner"] as? [String: Any]
+            let name = displayName(row["chat_name"] as? String)
+                ?? (kind == .p2p ? displayName(partner?["name"] as? String) : nil)
+                ?? displayName(knownChat?.name)
+                ?? (kind == .p2p ? "单聊" : "未命名会话")
+            return MessageSearchHit(message: message, chat: LarkChat(
+                id: chatID, name: name, kind: kind
+            ))
+        }
+        let token = root["page_token"] as? String ?? root["next_page_token"] as? String ?? root["nextPageToken"] as? String
+        let hasMore = root["has_more"] as? Bool ?? root["hasMore"] as? Bool
+        return MessageSearchPage(hits: hits, nextPageToken: hasMore == false ? nil : token.flatMap { $0.isEmpty ? nil : $0 })
+    }
+
     public static func threadSearchHits(from data: Data) throws -> [ThreadSearchHit] {
         let root = try payload(from: data)
         return threadSearchHits(from: root)

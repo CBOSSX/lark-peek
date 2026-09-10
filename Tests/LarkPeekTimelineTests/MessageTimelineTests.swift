@@ -2,10 +2,154 @@ import AppKit
 import SwiftUI
 import Testing
 import LarkPeekCore
+import ImageIO
+import UniformTypeIdentifiers
 @testable import LarkPeekTimeline
 
 @Suite(.serialized) @MainActor
 struct MessageTimelineTests {
+    @Test func forwardedAndTopicCardsAnimateTheirRealHeightsWithoutMovingTheHeader() throws {
+        let forwarded = LarkMessage(id: "om_forward", chatID: "oc_test", createTime: Date(), sender: MessageSender(name: "Alice"),
+            content: "合并消息", forwardedMessages: (0..<5).map {
+                ForwardedMessageItem(senderName: "同事 \($0)", content: "这是一条合并转发消息。\n展开时内容逐渐显示，收起时高度平滑回缩。")
+            })
+        let replies = (0..<5).map { LarkMessage(id: "om_reply_\($0)", chatID: "oc_test", createTime: Date(),
+            sender: MessageSender(name: "同事 \($0)"), content: "这里是话题讨论的回复。\n查看时保持标题位置稳定。") }
+        let topic = LarkMessage(id: "om_topic", chatID: "oc_test", createTime: Date(), sender: MessageSender(name: "Alice"),
+            content: "讨论下一步安排", threadID: "omt_test", threadReplies: replies, threadRepliesLoaded: true)
+        for message in [forwarded, topic] {
+            let fixture = WindowFixture()
+            defer { fixture.close() }
+            fixture.controller.reduceMotionOverride = false
+            fixture.controller.view.wantsLayer = true
+            fixture.controller.view.layer?.backgroundColor = NSColor(calibratedWhite: 0.15, alpha: 1).cgColor
+            func content(expanded: Bool) -> [TimelineRow] {
+                let card = MessageContentView(message: message, expandThreadByDefault: false,
+                    expandedCards: .constant([message.id: expanded]), replyError: nil,
+                    onLoadThreadReplies: {}, onOpenImage: { _ in })
+                return rows(0..<5) + [TimelineRow(id: message.id, version: expanded,
+                    content: AnyView(card.preferredColorScheme(.dark)), expansionVersion: expanded)] + rows(6..<12)
+            }
+            fixture.controller.update(sessionID: fixture.id, rows: content(expanded: false))
+            fixture.layout()
+            fixture.scroll(to: fixture.controller.timelineLayout.frames[5].minY - 40)
+            let headerY = fixture.screenY(at: 5)
+            let collapsedHeight = fixture.controller.timelineLayout.frames[5].height
+            fixture.controller.update(sessionID: fixture.id, rows: content(expanded: true), interactionAnchor: message.id, interactionRevision: 1)
+            #expect(fixture.controller.isAnimatingExpansion)
+            #expect(fixture.controller.timelineLayout.frames[5].height == collapsedHeight)
+            let url = URL(fileURLWithPath: "/tmp/lark-peek-\(message.id)-animation.gif")
+            let destination = try #require(CGImageDestinationCreateWithURL(url as CFURL, UTType.gif.identifier as CFString, 14, nil))
+            CGImageDestinationSetProperties(destination, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary)
+            var intermediateHeight: CGFloat = 0
+            for progress in [0.0, 0.08, 0.18, 0.32, 0.5, 0.75, 1.0] {
+                fixture.controller.advanceExpansionAnimation(to: progress)
+                fixture.layout()
+                #expect(abs(fixture.screenY(at: 5) - headerY) <= 0.5)
+                if progress == 0.5 { intermediateHeight = fixture.controller.timelineLayout.frames[5].height }
+                try appendAnimationFrame(fixture.controller.view, to: destination, delay: progress == 1 ? 0.6 : 0.05)
+            }
+            let expandedHeight = fixture.controller.timelineLayout.frames[5].height
+            #expect(collapsedHeight < intermediateHeight && intermediateHeight < expandedHeight)
+            #expect(!fixture.controller.isAnimatingExpansion)
+            fixture.controller.update(sessionID: fixture.id, rows: content(expanded: false), interactionAnchor: message.id, interactionRevision: 2)
+            #expect(fixture.controller.isAnimatingExpansion)
+            for progress in [0.0, 0.08, 0.18, 0.32, 0.5, 0.75, 1.0] {
+                fixture.controller.advanceExpansionAnimation(to: progress)
+                fixture.layout()
+                #expect(abs(fixture.screenY(at: 5) - headerY) <= 0.5)
+                try appendAnimationFrame(fixture.controller.view, to: destination, delay: progress == 1 ? 0.6 : 0.05)
+            }
+            #expect(CGImageDestinationFinalize(destination))
+            #expect(abs(fixture.controller.timelineLayout.frames[5].height - collapsedHeight) <= 0.5)
+        }
+    }
+
+    @Test func lateRepliesAnimateAndInterruptedAnimationsCannotRewriteANewSession() {
+        let fixture = WindowFixture()
+        defer { fixture.close() }
+        fixture.controller.reduceMotionOverride = false
+        func content(_ loaded: Bool) -> [TimelineRow] {
+            rows(0..<10, enlarged: loaded ? 5 : nil).enumerated().map { index, row in
+                TimelineRow(id: row.id, version: row.version, content: row.content, expansionVersion: index == 5 ? loaded : false)
+            }
+        }
+        fixture.controller.update(sessionID: fixture.id, rows: content(false))
+        fixture.layout()
+        fixture.scroll(to: fixture.controller.timelineLayout.frames[5].minY - 40)
+        // Lazy replies arrived after expansion; there is no new click/revision.
+        fixture.controller.update(sessionID: fixture.id, rows: content(true))
+        #expect(fixture.controller.isAnimatingExpansion)
+        fixture.controller.advanceExpansionAnimation(to: 0.2)
+        let intermediate = fixture.controller.timelineLayout.frames[5].height
+        fixture.controller.update(sessionID: fixture.id, rows: content(false), interactionAnchor: "message-5", interactionRevision: 1)
+        #expect(fixture.controller.timelineLayout.frames[5].height == intermediate)
+        fixture.controller.scrollView.onUserInput?()
+        #expect(!fixture.controller.isAnimatingExpansion)
+        fixture.controller.update(sessionID: fixture.id, rows: content(true), interactionAnchor: "message-5", interactionRevision: 2)
+        #expect(fixture.controller.isAnimatingExpansion)
+        fixture.controller.update(sessionID: UUID(), rows: rows(30..<40))
+        let frames = fixture.controller.timelineLayout.frames
+        fixture.controller.advanceExpansionAnimation(to: 1)
+        #expect(!fixture.controller.isAnimatingExpansion)
+        #expect(fixture.controller.timelineLayout.frames == frames)
+    }
+
+    @Test func reduceMotionUsesImmediateLayoutAndTheTimedAnimationFinishes() async throws {
+        let fixture = WindowFixture()
+        defer { fixture.close() }
+        fixture.controller.reduceMotionOverride = true
+        fixture.controller.update(sessionID: fixture.id, rows: rows(0..<10))
+        fixture.layout()
+        fixture.controller.update(sessionID: fixture.id, rows: rows(0..<10, enlarged: 5), interactionAnchor: "message-5", interactionRevision: 1)
+        #expect(!fixture.controller.isAnimatingExpansion)
+        let expanded = fixture.controller.timelineLayout.frames[5].height
+        fixture.controller.reduceMotionOverride = false
+        fixture.controller.update(sessionID: fixture.id, rows: rows(0..<10), interactionAnchor: "message-5", interactionRevision: 2)
+        #expect(fixture.controller.isAnimatingExpansion)
+        try await Task.sleep(for: .milliseconds(400))
+        #expect(!fixture.controller.isAnimatingExpansion)
+        #expect(fixture.controller.timelineLayout.frames[5].height < expanded)
+    }
+
+    private func appendAnimationFrame(_ view: NSView, to destination: CGImageDestination, delay: Double) throws {
+        view.layoutSubtreeIfNeeded()
+        let bitmap = try #require(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        view.cacheDisplay(in: view.bounds, to: bitmap)
+        let image = try #require(bitmap.cgImage)
+        CGImageDestinationAddImage(destination, image, [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: delay]] as CFDictionary)
+    }
+
+    @Test func cachedConversationRestoresItsOwnAnchorAndExpansionGeometry() throws {
+        let fixture = WindowFixture()
+        defer { fixture.close() }
+        var position: TimelineReadingPosition?
+        fixture.controller.onPositionChange = { position = $0 }
+        fixture.controller.update(sessionID: fixture.id, rows: rows(0..<20, enlarged: 6))
+        fixture.layout()
+        fixture.scroll(to: fixture.controller.timelineLayout.frames[6].minY + 210)
+        let saved = try #require(position)
+        #expect(saved.messageID == "message-6")
+        #expect(abs(saved.screenY + 210) < 0.5)
+        #expect(!saved.isAtBottom)
+        fixture.controller.update(sessionID: UUID(), rows: rows(30..<50))
+        fixture.layout()
+        fixture.controller.update(sessionID: UUID(), rows: rows(0..<20, enlarged: 6), initialPosition: saved)
+        fixture.layout()
+        #expect(abs(fixture.screenY(at: 6) - saved.screenY) <= 0.5)
+    }
+
+    @Test func cachedBottomStaysAtBottomWhenTheNoticeChangesViewportHeight() {
+        let fixture = WindowFixture()
+        defer { fixture.close() }
+        let saved = TimelineReadingPosition(messageID: "message-19", screenY: -100, isAtBottom: true)
+        fixture.controller.update(sessionID: fixture.id, rows: rows(0..<20, enlarged: 19), initialPosition: saved)
+        fixture.layout()
+        fixture.window.setContentSize(CGSize(width: 420, height: 470))
+        fixture.layout()
+        #expect(abs(fixture.controller.scrollView.documentVisibleRect.maxY - fixture.controller.timelineLayout.collectionViewContentSize.height) <= 1)
+    }
+
     @Test func indicatorsStayHiddenAfterContentScrollingAndWindowResizing() {
         for style in [NSScroller.Style.legacy, .overlay] {
             let fixture = WindowFixture()

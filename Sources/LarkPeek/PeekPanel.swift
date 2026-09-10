@@ -25,6 +25,10 @@ private final class CardHostingView: NSHostingView<PeekPanelView> {
 @MainActor
 private final class PanelPresentation: ObservableObject {
     @Published var isPresented = false
+    @Published var isPinned = false
+    @Published var isSearching = false
+    @Published var searchSessionID: UUID?
+    var searchChat: LarkChat?
     /// Offset of the card within the window while the window is enlarged to give
     /// the fly-in animation room to render past the card's resting frame.
     @Published var cardOffset: CGSize = .zero
@@ -45,9 +49,18 @@ final class PeekPanelController {
     private let presentation = PanelPresentation()
     private lazy var imagePreviewController = ImagePreviewPanelController()
     private var closeTask: Task<Void, Never>?
+    var onCloseRequested: (() -> Void)?
+    var onPinChanged: (() -> Void)?
+    var onSearch: (() -> Void)?
+    let search: MessageSearchModel
+    var onSearchResult: ((MessageSearchHit) -> Void)?
 
-    init(model: PeekModel) {
+    init(model: PeekModel, search: MessageSearchModel? = nil) {
         self.model = model
+        self.search = search ?? MessageSearchModel { [weak model] command in
+            guard let model else { throw CancellationError() }
+            return try await model.searchMessages(command)
+        }
         panel = PeekPanel(
             contentRect: CGRect(
                 x: 0, y: 0,
@@ -59,6 +72,7 @@ final class PeekPanelController {
             defer: false
         )
         panel.level = .floating
+        panel.title = "Lark Peek"
         panel.isOpaque = false
         panel.backgroundColor = .clear
         // The shadow is drawn by SwiftUI inside the content view so it scales
@@ -67,7 +81,6 @@ final class PeekPanelController {
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         panel.animationBehavior = .utilityWindow
-
         installContentView()
     }
 
@@ -75,7 +88,15 @@ final class PeekPanelController {
         let hostingView = CardHostingView(rootView: PeekPanelView(
             model: model,
             presentation: presentation,
-            onClose: { [weak self] in self?.close() },
+            search: search,
+            onClose: { [weak self] in
+                guard let self else { return }
+                if let onCloseRequested = self.onCloseRequested { onCloseRequested() } else { self.close() }
+            },
+            onPin: { [weak self] in self?.setPinned(!(self?.isPinned ?? false)) },
+            onBack: { [weak self] in self?.toggleSearchPage() },
+            onSearchResult: { [weak self] in self?.onSearchResult?($0) },
+            onSearch: { [weak self] in self?.onSearch?() },
             onSelect: { [weak model] chat, conversation in
                 Task { @MainActor in await model?.select(chat, for: conversation) }
             },
@@ -92,17 +113,28 @@ final class PeekPanelController {
     }
 
     var isVisible: Bool { panel.isVisible }
+    var isPinned: Bool { presentation.isPinned }
+    var isSearching: Bool { presentation.isSearching }
+    var searchChat: LarkChat? { presentation.searchChat }
     /// Screen frame of the visible card (used for click-outside hit testing).
     var frame: CGRect { lastCardFrame }
 
     private var lastCardFrame: CGRect = .zero
     private var lastTriggerID: String?
 
-    func show(anchor axFrame: CGRect, triggerID: String) {
+    func show(anchor axFrame: CGRect, triggerID: String, preservePosition: Bool = false) {
         dismissPresentedImage()
         closeTask?.cancel()
         closeTask = nil
         lastTriggerID = triggerID
+        presentation.isSearching = false
+        presentation.searchSessionID = nil
+        search.clear()
+        if preservePosition, panel.isVisible, !lastCardFrame.isEmpty {
+            presentation.isPresented = true
+            return
+        }
+        presentation.isPinned = false
         let cardFrame = CGRect(origin: origin(for: axFrame, panelSize: Self.cardSize), size: Self.cardSize)
         lastCardFrame = cardFrame
         let anchor = cursorPoint(NSEvent.mouseLocation, relativeTo: cardFrame)
@@ -154,6 +186,7 @@ final class PeekPanelController {
     func close(triggerID: String? = nil, reason: String = "panel_control") {
         dismissPresentedImage()
         model.invalidatePreviewRequests()
+        search.cancel()
         let trigger = triggerID ?? lastTriggerID ?? "none"
         guard panel.isVisible, closeTask == nil else {
             LarkPeekDiagnostics.panel.debug(
@@ -167,6 +200,7 @@ final class PeekPanelController {
         // The window already covers the flight path, so the fly-out can start
         // immediately — no re-framing, no jump.
         presentation.isPresented = false
+        presentation.isPinned = false
         closeTask = Task { @MainActor [weak self] in
             // Wait for the fly-out animation before removing the window.
             try? await Task.sleep(for: .milliseconds(220))
@@ -174,6 +208,9 @@ final class PeekPanelController {
             self.panel.orderOut(nil)
             self.presentation.cardOffset = .zero
             self.model.dismiss()
+            self.search.clear()
+            self.presentation.searchSessionID = nil
+            self.presentation.isSearching = false
             self.closeTask = nil
             self.lastTriggerID = nil
             LarkPeekDiagnostics.panel.notice(
@@ -189,6 +226,39 @@ final class PeekPanelController {
 
     func contains(_ point: CGPoint) -> Bool {
         lastCardFrame.contains(point) || imagePreviewController.contains(point)
+    }
+
+    func setPinned(_ pinned: Bool) {
+        guard panel.isVisible, closeTask == nil else { return }
+        presentation.isPinned = pinned
+        // Pinning only changes dismissal behavior, exactly like Control + Option + P.
+        onPinChanged?()
+    }
+
+    func showSearch(currentChat: LarkChat?, anchor: CGRect) {
+        if !panel.isVisible || closeTask != nil {
+            show(anchor: anchor, triggerID: "search")
+        }
+        dismissPresentedImage()
+        if presentation.searchSessionID == nil || presentation.searchChat?.id != currentChat?.id {
+            search.clear()
+            presentation.searchChat = currentChat
+            presentation.searchSessionID = UUID()
+        }
+        setPinned(true)
+        presentation.isSearching = true
+        // Search lives inside this floating panel, so no second window can hide behind it.
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    func toggleSearchPage() {
+        guard presentation.searchSessionID != nil else { return }
+        presentation.isSearching.toggle()
+        if presentation.isSearching { panel.makeKey() }
+    }
+
+    func showSearchResult() {
+        presentation.isSearching = false
     }
 
     private func showPresentedImage(_ item: PresentedImage) {
@@ -271,7 +341,13 @@ final class PeekPanelController {
 private struct PeekPanelView: View {
     @ObservedObject var model: PeekModel
     @ObservedObject var presentation: PanelPresentation
+    @ObservedObject var search: MessageSearchModel
     let onClose: () -> Void
+    let onPin: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let onBack: () -> Void
+    let onSearchResult: (MessageSearchHit) -> Void
+    let onSearch: () -> Void
     let onSelect: (LarkChat, HoveredConversation) -> Void
     let onRetry: () -> Void
     let onOpenImage: (PresentedImage) -> Void
@@ -282,11 +358,31 @@ private struct PeekPanelView: View {
         VStack(spacing: 0) {
             header
             hairline
-            content
-                .id(stateKey)
-                .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .top)))
+            ZStack {
+                content
+                    .id(stateKey)
+                    .transition(.asymmetric(
+                        insertion: .opacity.combined(with: .offset(y: reduceMotion ? 0 : 8)),
+                        removal: .opacity.combined(with: .offset(y: reduceMotion ? 0 : -6))
+                    ))
+                    .opacity(presentation.isSearching ? 0 : 1)
+                    .offset(x: presentation.isSearching && !reduceMotion ? -24 : 0)
+                    .allowsHitTesting(!presentation.isSearching)
+                    .accessibilityHidden(presentation.isSearching)
+                if let searchSessionID = presentation.searchSessionID {
+                    MessageSearchView(model: search, currentChat: presentation.searchChat, isActive: presentation.isSearching, onSelect: onSearchResult)
+                        .id(searchSessionID)
+                        .opacity(presentation.isSearching ? 1 : 0)
+                        .offset(x: presentation.isSearching || reduceMotion ? 0 : 24)
+                        .allowsHitTesting(presentation.isSearching)
+                        .accessibilityHidden(!presentation.isSearching)
+                        .transition(.opacity)
+                }
+            }
+            .clipped()
         }
-        .animation(.easeOut(duration: 0.16), value: stateKey)
+        .animation(reduceMotion ? .easeOut(duration: 0.12) : .spring(response: 0.3, dampingFraction: 0.9), value: presentation.isSearching)
+        .animation(.easeOut(duration: reduceMotion ? 0.12 : 0.2), value: stateKey)
         .frame(width: PeekPanelController.cardSize.width, height: PeekPanelController.cardSize.height)
         .background { glassBackground }
         .clipShape(cardShape)
@@ -359,9 +455,9 @@ private struct PeekPanelView: View {
     private var stateKey: String {
         switch model.state {
         case .waiting: "waiting"
-        case .loading: "loading"
+        case .loading: "loading-\(model.timeline.id)"
         case .candidates: "candidates"
-        case .messages: "messages"
+        case .messages: "messages-\(model.timeline.id)"
         case .error: "error"
         }
     }
@@ -371,10 +467,37 @@ private struct PeekPanelView: View {
             Image(systemName: "eye.circle.fill")
                 .font(.system(size: 22, weight: .semibold))
                 .foregroundStyle(.blue.gradient)
-            Text(title)
+            if presentation.searchSessionID != nil, !presentation.isSearching || model.state != .waiting {
+                Button(action: onBack) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 13, weight: .medium))
+                        .frame(width: 32, height: 32)
+                        .contentShape(Rectangle())
+                }
+                    .buttonStyle(.plain)
+                    .modifier(HoverBackground(cornerRadius: 9))
+                    .help(presentation.isSearching ? "返回消息" : "返回搜索")
+                    .accessibilityLabel(presentation.isSearching ? "返回消息" : "返回搜索")
+                    .accessibilityIdentifier("peek-back-button")
+            }
+            Text(presentation.isSearching ? "搜索消息" : title)
                 .font(.system(size: 15, weight: .semibold))
                 .lineLimit(1)
-            Spacer(minLength: 12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            if !presentation.isSearching {
+                Button(action: onSearch) { Image(systemName: "magnifyingglass") }
+                    .buttonStyle(.plain).help("搜索消息").accessibilityLabel("搜索消息")
+                Button(action: onRetry) { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.plain)
+                    .help(model.isCachedPreview ? "当前显示最近的预览缓存，点击重新读取" : "刷新预览")
+                    .accessibilityLabel("刷新预览")
+                Button(action: onPin) { Image(systemName: presentation.isPinned ? "pin.fill" : "pin") }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(presentation.isPinned ? Color.accentColor : Color.secondary)
+                    .help(presentation.isPinned ? "切回长按预览" : "保持打开（与 ⌃⌥P 相同）")
+                    .accessibilityLabel(presentation.isPinned ? "取消固定" : "固定预览")
+            }
             Button(action: onClose) {
                 Image(systemName: "xmark")
                     .font(.system(size: 11, weight: .bold))
@@ -384,6 +507,7 @@ private struct PeekPanelView: View {
             }
             .buttonStyle(.plain)
             .help("关闭（Esc）")
+            .accessibilityLabel("关闭预览")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 13)
@@ -399,12 +523,19 @@ private struct PeekPanelView: View {
         case let .candidates(conversation, chats):
             candidateView(conversation, chats: chats)
         case let .messages(conversation, _, messages, _):
-            MessageTimelineView(
-                model: model,
-                messages: messages,
-                expandThreadsByDefault: conversation.threadHint != nil,
-                onOpenImage: onOpenImage
-            )
+            VStack(spacing: 0) {
+                if let notice = model.previewNotice {
+                    Text(notice).font(.system(size: 10)).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.vertical, 4)
+                }
+                MessageTimelineView(
+                    model: model,
+                    messages: messages,
+                    expandThreadsByDefault: conversation.threadHint != nil,
+                    onOpenImage: onOpenImage
+                )
+                .id(model.timeline.id)
+            }
         case let .error(_, message):
             errorView(message)
         }

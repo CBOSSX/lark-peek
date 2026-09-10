@@ -8,6 +8,8 @@ public struct MessageTimelineView: View {
     private let messages: [LarkMessage]
     private let expandThreadsByDefault: Bool
     private let onOpenImage: (PresentedImage) -> Void
+    private let readingState: PreviewReadingState
+    private let sessionID: UUID
     @State private var expandedCards: [String: Bool] = [:]
     @State private var interactionAnchor: String?
     @State private var interactionRevision = 0
@@ -17,23 +19,35 @@ public struct MessageTimelineView: View {
         self.messages = messages
         self.expandThreadsByDefault = expandThreadsByDefault
         self.onOpenImage = onOpenImage
+        self.readingState = model.readingState
+        self.sessionID = model.timeline.id
+        _expandedCards = State(initialValue: model.readingState.expandedCards)
     }
 
     public var body: some View {
-        let sessionID = model.timeline.id
         let revision = model.timeline.revision
-        return NativeMessageTimeline(sessionID: sessionID, rows: timelineRows, interactionAnchor: interactionAnchor, interactionRevision: interactionRevision) {
+        return NativeMessageTimeline(sessionID: sessionID, rows: timelineRows, interactionAnchor: interactionAnchor, interactionRevision: interactionRevision,
+            initialPosition: readingState.position, onPositionChange: {
+                guard model.timeline.id == sessionID else { return }
+                readingState.position = $0
+            }) {
             Task {
                 guard model.timeline.id == sessionID, model.timeline.revision == revision else { return }
                 await model.loadOlderMessages(automatic: true)
             }
         }
-        .onChange(of: model.timeline.id) { expandedCards = [:] }
     }
 
     private struct RowVersion: Hashable {
         let message: LarkMessage
         let expanded: [String: Bool]
+        let replyError: String?
+    }
+
+    private struct ExpansionVersion: Hashable {
+        let expanded: [String: Bool]
+        let repliesLoaded: Bool
+        let replyCount: Int
         let replyError: String?
     }
 
@@ -47,9 +61,15 @@ public struct MessageTimelineView: View {
         rows += messages.map { message in
             let ids = Set([message.id] + message.threadReplies.map(\.id))
             let version = RowVersion(message: message, expanded: expandedCards.filter { ids.contains($0.key) }, replyError: message.threadID.flatMap { model.timeline.replyErrors[$0] })
+            let isThreadExpanded = expandedCards[message.id] ?? expandThreadsByDefault
+            let expansionVersion = ExpansionVersion(expanded: version.expanded,
+                repliesLoaded: isThreadExpanded && message.threadRepliesLoaded,
+                replyCount: isThreadExpanded ? message.threadReplies.count : 0,
+                replyError: isThreadExpanded ? version.replyError : nil)
             return TimelineRow(id: message.id, version: version, content: AnyView(
+                // Native layout owns the height animation; measuring SwiftUI must always see final geometry.
                 messageRow(message).transaction { $0.disablesAnimations = true }
-            ))
+            ), expansionVersion: expansionVersion)
         }
         return rows
     }
@@ -91,6 +111,7 @@ public struct MessageTimelineView: View {
             for key in Set(expansionSnapshot.keys).union($0.keys) where expansionSnapshot[key] != $0[key] {
                 expandedCards[key] = $0[key]
             }
+            readingState.expandedCards = expandedCards
         })
         return HStack(alignment: .top, spacing: 10) {
             SenderAvatar(name: message.sender.name)
@@ -122,6 +143,12 @@ public struct MessageTimelineView: View {
         .padding(11)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12))
+        .contextMenu {
+            Button("复制消息") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(message.content, forType: .string)
+            }
+        }
         .overlay {
             RoundedRectangle(cornerRadius: 12)
                 .stroke(Color.white.opacity(0.07), lineWidth: 1)
@@ -136,7 +163,7 @@ public struct MessageTimelineView: View {
     }()
 }
 
-private struct MessageContentView: View {
+struct MessageContentView: View {
     let message: LarkMessage
     let expandThreadByDefault: Bool
     @Binding var expandedCards: [String: Bool]
@@ -657,12 +684,21 @@ private struct MarkdownMessageView: View {
             .padding(.leading, CGFloat(level * 12))
 
         case .code:
-            Text(block.content)
-                .font(.system(size: 12, design: .monospaced))
-                .textSelection(.enabled)
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 7))
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Spacer()
+                    Button("复制代码") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(block.content, forType: .string)
+                    }.buttonStyle(.plain).font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                Text(block.content)
+                    .font(.system(size: 12, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(8)
+            .background(Color.black.opacity(0.16), in: RoundedRectangle(cornerRadius: 7))
         }
     }
 

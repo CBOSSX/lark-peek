@@ -14,6 +14,8 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
     private var peekTask: Task<Void, Never>?
     private var authorizationTask: Task<Void, Never>?
     private var optionHoldTask: Task<Void, Never>?
+    private var hoverScanTask: Task<Void, Never>?
+    private var hoverTracker = HoverPreviewTracker()
     private var isOptionHeld = false
     private var isOptionPeekActive = false
     private var activeTriggerID: String?
@@ -31,7 +33,21 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
             "event=app_launch version=\(self.appVersion, privacy: .public) build=\(self.appBuild, privacy: .public) os=\(ProcessInfo.processInfo.operatingSystemVersionString, privacy: .public) arch=\(self.architecture, privacy: .public) accessibility=\(self.hoverResolver.isAccessibilityTrusted)"
         )
         installStatusItem()
+        installEditingMenu()
         installEventMonitors()
+        panelController.onCloseRequested = { [weak self] in self?.closePeek(reason: "panel_control") }
+        panelController.onPinChanged = { [weak self] in
+            guard let self else { return }
+            self.optionHoldTask?.cancel()
+            self.optionHoldTask = nil
+            self.hoverScanTask?.cancel()
+            self.isOptionHeld = NSEvent.modifierFlags.contains(.option)
+            self.isOptionPeekActive = !self.panelController.isPinned && self.isOptionHeld
+            if self.isOptionPeekActive { self.startHoverScan() }
+            else if !self.panelController.isPinned { self.closePeek(reason: "unpin_without_option") }
+        }
+        panelController.onSearch = { [weak self] in self?.showSearchFromPreview() }
+        panelController.onSearchResult = { [weak self] hit in self?.previewSearchHit(hit) }
         model.$statusMessage
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.rebuildMenu() }
@@ -52,6 +68,8 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         peekTask?.cancel()
         authorizationTask?.cancel()
         optionHoldTask?.cancel()
+        hoverScanTask?.cancel()
+        panelController.search.clear()
         for monitor in monitors { NSEvent.removeMonitor(monitor) }
         monitors.removeAll()
     }
@@ -64,6 +82,30 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
+    private func installEditingMenu() {
+        // Text fields and selected message text need the standard responder-chain shortcuts.
+        let menu = NSMenu()
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "退出 Lark Peek", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        menu.addItem(appItem)
+        let editItem = NSMenuItem(title: "编辑", action: nil, keyEquivalent: "")
+        let editMenu = NSMenu(title: "编辑")
+        for (title, action, key) in [
+            ("撤销", Selector(("undo:")), "z"),
+            ("剪切", #selector(NSText.cut(_:)), "x"),
+            ("复制", #selector(NSText.copy(_:)), "c"),
+            ("粘贴", #selector(NSText.paste(_:)), "v"),
+            ("全选", #selector(NSText.selectAll(_:)), "a")
+        ] {
+            editMenu.addItem(withTitle: title, action: action, keyEquivalent: key)
+        }
+        editItem.submenu = editMenu
+        menu.addItem(editItem)
+        NSApp.mainMenu = menu
+    }
+
     private func rebuildMenu() {
         let menu = NSMenu()
         let status = NSMenuItem(title: model.statusMessage, action: nil, keyEquivalent: "")
@@ -73,6 +115,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         guide.isEnabled = false
         menu.addItem(guide)
         menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "搜索消息…（⌃⌥F）", action: #selector(showSearch), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "检查辅助功能权限…", action: #selector(requestAccessibility), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "选择 lark-cli…", action: #selector(selectCLI), keyEquivalent: ""))
         if model.authStatus.state == .needsLogin {
@@ -121,8 +164,18 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
             return
         }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if event.keyCode == 3, flags == [.control, .option] {
+            showSearch()
+            return
+        }
         guard event.keyCode == 35, flags.contains([.control, .option]) else { return }
+        if panelController.isVisible {
+            if panelController.isPinned { closePeek(reason: "shortcut_toggle") }
+            else { panelController.setPinned(true) }
+            return
+        }
         activatePeek(source: "control_option_p", showResolutionErrors: true)
+        panelController.setPinned(true)
     }
 
     private func handleModifierFlags(_ event: NSEvent) {
@@ -132,6 +185,11 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         let optionKeyCodes: Set<UInt16> = [58, 61]
 
         if optionOnly {
+            guard !panelController.isPinned, !panelController.isSearching else { return }
+            if isOptionHeld {
+                if isOptionPeekActive, hoverScanTask == nil { startHoverScan() }
+                return
+            }
             // Only an actual left/right Option key-down starts a hold gesture.
             // Releasing another modifier while Option remains down must not start one.
             guard optionKeyCodes.contains(event.keyCode) else { return }
@@ -143,18 +201,22 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
             optionHoldTask?.cancel()
             optionHoldTask = Task { [weak self] in
                 try? await Task.sleep(for: .milliseconds(120))
-                guard !Task.isCancelled, let self, self.isOptionHeld else { return }
+                guard !Task.isCancelled, let self, self.isOptionHeld, !self.panelController.isPinned else { return }
                 self.optionHoldTask = nil
                 self.isOptionPeekActive = true
+                self.hoverTracker = HoverPreviewTracker()
                 self.activatePeek(source: "option_hold", showResolutionErrors: false)
+                self.startHoverScan()
             }
             return
         }
 
-        isOptionHeld = false
+        isOptionHeld = flags.contains(.option)
         optionHoldTask?.cancel()
         optionHoldTask = nil
-        if isOptionPeekActive {
+        hoverScanTask?.cancel()
+        hoverScanTask = nil
+        if isOptionPeekActive && !isOptionHeld {
             isOptionPeekActive = false
             closePeek(reason: "option_release")
         }
@@ -167,14 +229,8 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         )
         do {
             let conversation = try hoverResolver.resolveCurrentConversation(triggerID: triggerID)
-            peekTask?.cancel()
-            activeTriggerID = triggerID
-            panelController.show(anchor: conversation.rowFrame, triggerID: triggerID)
-            peekTask = Task { [weak self] in
-                await LarkPeekDiagnostics.$triggerID.withValue(triggerID) {
-                    await self?.model.peek(conversation)
-                }
-            }
+            hoverTracker.activate(conversation)
+            showConversation(conversation, triggerID: triggerID)
         } catch HoverResolverError.accessibilityPermissionMissing {
             LarkPeekDiagnostics.input.error(
                 "event=preview_aborted trigger=\(triggerID, privacy: .public) source=\(source, privacy: .public) code=permission_missing feedback=\(showResolutionErrors)"
@@ -205,6 +261,8 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         optionHoldTask?.cancel()
         optionHoldTask = nil
         isOptionPeekActive = false
+        hoverScanTask?.cancel()
+        hoverScanTask = nil
         peekTask?.cancel()
         // The controller dismisses the model after the fly-out animation finishes.
         panelController.close(triggerID: activeTriggerID, reason: reason)
@@ -214,6 +272,70 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
     private func closeIfClickIsOutside(at point: CGPoint) {
         guard panelController.isVisible else { return }
         if !panelController.contains(point) { closePeek(reason: "outside_click") }
+    }
+
+    private func showConversation(_ conversation: HoveredConversation, triggerID: String, preservePosition: Bool = false) {
+        peekTask?.cancel()
+        model.invalidatePreviewRequests()
+        activeTriggerID = triggerID
+        panelController.show(anchor: conversation.rowFrame, triggerID: triggerID, preservePosition: preservePosition)
+        peekTask = Task { [weak self] in
+            guard !Task.isCancelled else { return }
+            await LarkPeekDiagnostics.$triggerID.withValue(triggerID) { await self?.model.peek(conversation) }
+        }
+    }
+
+    private func startHoverScan() {
+        hoverScanTask?.cancel()
+        hoverScanTask = Task { [weak self] in
+            var lastPoint = NSEvent.mouseLocation
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .milliseconds(80)) } catch { return }
+                guard let self, self.isOptionHeld, self.isOptionPeekActive, !self.panelController.isPinned else { return }
+                let point = NSEvent.mouseLocation
+                guard point != lastPoint || self.hoverTracker.hasPendingCandidate else { continue }
+                lastPoint = point
+                let time = ProcessInfo.processInfo.systemUptime
+                guard !self.panelController.contains(point) else {
+                    _ = self.hoverTracker.observe(nil, at: time)
+                    continue
+                }
+                let triggerID = LarkPeekDiagnostics.makeTriggerID()
+                let conversation = try? self.hoverResolver.resolveCurrentConversation(triggerID: triggerID)
+                if let next = self.hoverTracker.observe(conversation, at: time) {
+                    self.showConversation(next, triggerID: triggerID, preservePosition: true)
+                }
+            }
+        }
+    }
+
+    @objc private func showSearch() {
+        openSearch(currentChat: nil)
+    }
+
+    private func showSearchFromPreview() {
+        let chat: LarkChat?
+        if case let .messages(_, value, _, _) = model.state { chat = value } else { chat = nil }
+        openSearch(currentChat: chat)
+    }
+
+    private func openSearch(currentChat: LarkChat?) {
+        optionHoldTask?.cancel()
+        hoverScanTask?.cancel()
+        isOptionPeekActive = false
+        panelController.showSearch(currentChat: currentChat, anchor: cursorAnchor())
+    }
+
+    private func previewSearchHit(_ hit: MessageSearchHit) {
+        peekTask?.cancel()
+        model.invalidatePreviewRequests()
+        let triggerID = LarkPeekDiagnostics.makeTriggerID()
+        activeTriggerID = triggerID
+        panelController.showSearchResult()
+        peekTask = Task { [weak self] in
+            guard !Task.isCancelled else { return }
+            await self?.model.previewSearchHit(hit)
+        }
     }
 
     @objc private func requestAccessibility() {

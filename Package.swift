@@ -20,6 +20,10 @@ let package = Package(
             dependencies: ["LarkPeekCore"]
         ),
         .testTarget(
+            name: "LarkPeekAppTests",
+            dependencies: ["LarkPeek"]
+        ),
+        .testTarget(
             name: "LarkPeekTimelineTests",
             dependencies: ["LarkPeekTimeline"]
         )

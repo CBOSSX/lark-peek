@@ -37,7 +37,7 @@ public enum ReadOnlyCommand: Equatable, Sendable {
         pageSize: Int = 10
     )
     case chatDetails(chatID: String)
-    case recentMessages(chatID: String, pageToken: String? = nil, pageSize: Int = 20)
+    case recentMessages(chatID: String, pageToken: String? = nil, pageSize: Int = 20, end: String? = nil)
     case threadMessages(threadID: String, pageToken: String? = nil, pageSize: Int = 50)
     /// Performs a server-side GET and writes only to an app-controlled temporary file.
     case messageImage(messageID: String, fileKey: String, outputPath: String)
@@ -121,7 +121,7 @@ public enum ReadOnlyCommand: Equatable, Sendable {
                 "--format", "json"
             ]
 
-        case let .recentMessages(chatID, pageToken, pageSize):
+        case let .recentMessages(chatID, pageToken, pageSize, end):
             try validateChatID(chatID)
             var arguments = [
                 "im", "+chat-messages-list",
@@ -132,6 +132,7 @@ public enum ReadOnlyCommand: Equatable, Sendable {
                 "--no-reactions",
                 "--format", "json"
             ]
+            try appendDateFilter(end, flag: "--end", to: &arguments)
             try appendPageToken(pageToken, to: &arguments)
             return arguments
 

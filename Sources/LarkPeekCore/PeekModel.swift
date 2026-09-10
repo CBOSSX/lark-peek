@@ -31,6 +31,12 @@ public final class PeekModel: ObservableObject {
     public var hasOlderMessages: Bool { timeline.pagination.cursor != nil }
     public var isLoadingOlderMessages: Bool { timeline.pagination.isLoading }
     @Published public private(set) var diagnosticTriggerID: String?
+    @Published public private(set) var previewNotice: String?
+    @Published public private(set) var isCachedPreview = false
+    private var contextEnd: String?
+    private var searchHit: MessageSearchHit?
+    public private(set) var readingState = PreviewReadingState()
+    private var previewCache: [String: (page: LarkCLIParser.MessagePage, date: Date, reading: PreviewReadingState)] = [:]
 
     private var client: LarkCLIClient?
     private var recentChats: [LarkChat] = []
@@ -103,7 +109,14 @@ public final class PeekModel: ObservableObject {
     }
 
     public func peek(_ conversation: HoveredConversation) async {
+        saveCachedPreview()
+        state = .loading(conversation)
         resetTimeline()
+        readingState = PreviewReadingState()
+        contextEnd = nil
+        searchHit = nil
+        previewNotice = nil
+        isCachedPreview = false
         await timeline.schedule(key: "initial") { [weak self] in
             await self?.performPeek(conversation)
         }.value
@@ -251,7 +264,14 @@ public final class PeekModel: ObservableObject {
     }
 
     public func select(_ chat: LarkChat, for conversation: HoveredConversation) async {
+        saveCachedPreview()
+        state = .loading(conversation)
         resetTimeline()
+        readingState = PreviewReadingState()
+        contextEnd = nil
+        searchHit = nil
+        previewNotice = nil
+        isCachedPreview = false
         await timeline.schedule(key: "initial") { [weak self] in
             guard let self else { return }
             self.publishState(.loading(conversation))
@@ -272,6 +292,11 @@ public final class PeekModel: ObservableObject {
     }
 
     public func retryCurrent() async {
+        if let searchHit {
+            await previewSearchHit(searchHit)
+            return
+        }
+        previewCache.removeAll()
         let conversation: HoveredConversation?
         switch state {
         case let .loading(value), let .candidates(value, _), let .messages(value, _, _, _): conversation = value
@@ -283,10 +308,56 @@ public final class PeekModel: ObservableObject {
     }
 
     public func dismiss() {
+        saveCachedPreview()
+        state = .waiting
         cancelTransientRequests()
         resetTimeline()
         diagnosticTriggerID = nil
         state = .waiting
+        searchHit = nil
+        contextEnd = nil
+        previewNotice = nil
+        isCachedPreview = false
+    }
+
+    public func searchMessages(_ command: ReadOnlyCommand) async throws -> MessageSearchPage {
+        guard case .searchMessages = command else { throw CommandPolicyError.invalidQuery }
+        // Capture known names before awaiting: the user may navigate while search is running.
+        var knownChats = Dictionary(recentChats.map { ($0.id, $0) }, uniquingKeysWith: { _, newer in newer })
+        if let chat = timeline.chat { knownChats[chat.id] = chat }
+        let result = try await requireClient().run(command)
+        return try LarkCLIParser.messageSearchPage(from: result.data, knownChats: knownChats)
+    }
+
+    public func previewSearchHit(_ hit: MessageSearchHit) async {
+        saveCachedPreview()
+        let conversation = HoveredConversation(name: hit.chat.name, rowFrame: .zero, rowTexts: [])
+        state = .loading(conversation)
+        resetTimeline()
+        readingState = PreviewReadingState()
+        searchHit = hit
+        contextEnd = ISO8601DateFormatter().string(from: hit.message.createTime.addingTimeInterval(1))
+            .replacingOccurrences(of: "Z", with: "+00:00")
+        previewNotice = "搜索命中及此前消息"
+        isCachedPreview = false
+        await timeline.schedule(key: "initial") { [weak self] in
+            guard let self else { return }
+            let sessionID = self.timeline.id
+            // Show the exact hit immediately, even if its surrounding history cannot be loaded.
+            self.timeline.install(conversation: conversation, chat: hit.chat, messages: [hit.message], cursor: nil, sessionID: sessionID)
+            do {
+                let client = try self.requireClient()
+                let result = try await client.run(.recentMessages(chatID: hit.chat.id, pageSize: 20, end: self.contextEnd))
+                try self.timeline.checkCurrentRequest()
+                let page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: hit.chat.id)
+                self.timeline.install(conversation: conversation, chat: hit.chat,
+                    messages: MessageTimeline.merging(page.messages, into: [hit.message]), cursor: page.nextPageToken, sessionID: sessionID)
+                self.scheduleEnrichment(using: client)
+            } catch {
+                guard self.timeline.isCurrent(sessionID), !Task.isCancelled else { return }
+                self.previewNotice = "已显示命中消息；上下文加载失败，可刷新重试"
+            }
+        }.value
     }
 
     public func presentError(_ message: String) {
@@ -312,7 +383,7 @@ public final class PeekModel: ObservableObject {
             for attempt in 0..<3 {
                 try timeline.checkCurrentRequest()
                 visited.insert(cursor)
-                let result = try await client.run(.recentMessages(chatID: chat.id, pageToken: cursor, pageSize: 20))
+                let result = try await client.run(.recentMessages(chatID: chat.id, pageToken: cursor, pageSize: 20, end: contextEnd))
                 try timeline.checkCurrentRequest()
                 let page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: chat.id)
                 let knownIDs = Set(timeline.messages.map(\.id))
@@ -346,6 +417,7 @@ public final class PeekModel: ObservableObject {
     }
 
     public func showPreviewFixture() {
+        readingState = PreviewReadingState()
         diagnosticTriggerID = "fixture"
         resetTimeline()
         let conversation = HoveredConversation(
@@ -419,6 +491,7 @@ public final class PeekModel: ObservableObject {
     }
 
     private func configureClient() {
+        previewCache.removeAll()
         let selected = defaults.string(forKey: "selectedLarkCLIPath").map(URL.init(fileURLWithPath:))
         do {
             let resolved = try LarkCLIClient(executableURL: selected, workingDirectory: workingDirectory)
@@ -512,11 +585,38 @@ public final class PeekModel: ObservableObject {
     ) async throws {
         try timeline.checkCurrentRequest()
         let sessionID = timeline.id
-        let result = try await client.run(.recentMessages(chatID: chat.id, pageSize: 20))
-        try timeline.checkCurrentRequest()
-        let page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: chat.id)
+        previewCache = previewCache.filter { Date().timeIntervalSince($0.value.date) < 15 }
+        let page: LarkCLIParser.MessagePage
+        if let cached = previewCache[chat.id] {
+            page = cached.page
+            readingState = cached.reading
+            isCachedPreview = true
+        } else {
+            let result = try await client.run(.recentMessages(chatID: chat.id, pageSize: 20))
+            try timeline.checkCurrentRequest()
+            page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: chat.id)
+            if previewCache.count >= 4, let oldest = previewCache.min(by: { $0.value.date < $1.value.date })?.key {
+                previewCache[oldest] = nil
+            }
+            previewCache[chat.id] = (page, Date(), readingState)
+        }
         timeline.install(conversation: conversation, chat: chat, messages: page.messages, cursor: page.nextPageToken, sessionID: sessionID)
         scheduleEnrichment(using: client)
+    }
+
+    private func saveCachedPreview() {
+        guard searchHit == nil, let chat = timeline.chat,
+              let cached = previewCache[chat.id], Date().timeIntervalSince(cached.date) < 15,
+              !timeline.messages.isEmpty else { return }
+        // Preserve loaded history and expansion without retaining another copy of image binaries.
+        func withoutImageData(_ value: LarkMessage) -> LarkMessage {
+            var message = value
+            message.images = message.images.map { MessageImage(key: $0.key) }
+            message.threadReplies = message.threadReplies.map(withoutImageData)
+            return message
+        }
+        let page = LarkCLIParser.MessagePage(messages: timeline.messages.map(withoutImageData), nextPageToken: timeline.pagination.cursor)
+        previewCache[chat.id] = (page, cached.date, cached.reading)
     }
 
     private func findThread(
