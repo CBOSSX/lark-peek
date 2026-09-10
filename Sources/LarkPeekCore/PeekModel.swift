@@ -148,8 +148,7 @@ public final class PeekModel: ObservableObject {
                 let resolution = try await ThreadResolver(run: { try await client.run($0) }).resolve(hint)
                 try timeline.checkCurrentRequest()
                 threadMatchLogger.info("event=thread_resolution trigger=\(trigger, privacy: .public) candidates=\(resolution.candidates.count) complete=\(resolution.complete)")
-                if resolution.complete, resolution.candidates.count == 1,
-                   let candidate = resolution.candidates.first, candidate.replyVerified {
+                if let candidate = resolution.automaticCandidate {
                     try await loadThread(root: candidate.root, chat: candidate.chat, conversation: conversation, using: client)
                 } else if !resolution.candidates.isEmpty {
                     publishState(.threadCandidates(conversation, resolution.candidates, resolution.complete))
@@ -694,7 +693,11 @@ public final class PeekModel: ObservableObject {
         let sessionID = timeline.id
         guard let threadID = root.threadID else { throw LarkCLIError.malformedResponse }
         var root = root
-        root.threadRepliesLoaded = false
+        if root.threadRepliesLoaded {
+            timeline.install(conversation: conversation, chat: chat, messages: [root], cursor: nil, sessionID: sessionID)
+            scheduleEnrichment(using: client)
+            return
+        }
         let result = try await client.run(.threadMessages(threadID: threadID, pageSize: 50))
         try timeline.checkCurrentRequest()
         let page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: chat.id)

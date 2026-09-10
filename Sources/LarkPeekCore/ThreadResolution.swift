@@ -22,11 +22,20 @@ public enum ThreadText {
         ConversationText.normalize(displayText(text))
     }
 
-    public static func matches(excerpt: String, content: String) -> Bool {
+    public static func matches(excerpt: String, content: String, allowsLongPrefix: Bool = false) -> Bool {
         let expected = normalized(excerpt)
         let actual = normalized(content)
         guard !expected.isEmpty, !actual.isEmpty else { return false }
         if expected == actual { return true }
+        if allowsLongPrefix, expected.count >= 120 {
+            // Feishu caps long AX titles without an ellipsis and flattens list
+            // markers. The full visible prefix and author must still match the root.
+            func words(_ value: String) -> String {
+                value.components(separatedBy: .punctuationCharacters).joined()
+            }
+            let prefix = words(expected)
+            if prefix.count >= 100, words(actual).hasPrefix(prefix) { return true }
+        }
         // Only permit truncation when the UI explicitly indicated it.
         return (excerpt.hasSuffix("…") || excerpt.hasSuffix("..."))
             && expected.count >= 8 && actual.hasPrefix(expected)
@@ -57,6 +66,13 @@ public struct ThreadCandidate: Equatable, Sendable, Identifiable {
 struct ThreadResolution: Sendable {
     var candidates: [ThreadCandidate]
     var complete: Bool
+
+    var automaticCandidate: ThreadCandidate? {
+        guard complete else { return nil }
+        if candidates.count == 1 { return candidates.first }
+        let verified = candidates.filter(\.replyVerified)
+        return verified.count == 1 ? verified.first : nil
+    }
 }
 
 /// Bounded discovery, followed by validation of real messages. No text-to-ID
@@ -72,37 +88,25 @@ struct ThreadResolver: Sendable {
         let bounds = activityBounds(hint.activityMarker, now: now)
         let rootQueries = ThreadText.queries(hint.rootExcerpt)
         let replyQueries = ThreadText.queries(hint.latestReplyExcerpt)
-        // One independent query from each side first, then one alternate root clause.
-        let queries = rootQueries.prefix(1).map { ($0, false) }
-            + replyQueries.prefix(1).map { ($0, true) }
-            + rootQueries.dropFirst().prefix(1).map { ($0, false) }
-        for (query, reply) in queries {
-            var token: String?
-            var seen = Set<String>()
-            for _ in 0..<maximumPages {
-                try Task.checkCancellation()
-                let result = try await run(.searchMessages(query: query, pageToken: token,
-                    start: reply ? bounds?.start : nil, end: reply ? bounds?.end : nil, pageSize: 50))
-                let page = try LarkCLIParser.messageSearchPage(from: result.data)
-                let envelope = try JSONSerialization.jsonObject(with: result.data) as? [String: Any]
-                let payload = envelope?["data"] as? [String: Any] ?? envelope
-                let rawCount = (payload?["messages"] as? [Any])?.count ?? 0
-                if rawCount != page.hits.count
-                    || (payload?["has_more"] as? Bool == true && page.nextPageToken == nil) { complete = false }
-                let trigger = LarkPeekDiagnostics.triggerID ?? "none"
-                LarkPeekDiagnostics.threadMatching.info("event=thread_search_page trigger=\(trigger, privacy: .public) raw=\(rawCount) parsed=\(page.hits.count) hasMore=\(page.nextPageToken != nil)")
-                for hit in page.hits where hit.message.threadID != nil && !hit.message.deleted {
-                    hits[hit.message.id] = hit
-                }
-                token = page.nextPageToken
-                guard let next = token else { break }
-                guard seen.insert(next).inserted else { break }
+        // Resolve the root first. Reply content is optional evidence, not a
+        // prerequisite for opening an otherwise unambiguous topic.
+        for query in rootQueries {
+            let batch = try await search(query, start: nil, end: nil)
+            complete = complete && batch.complete
+            for hit in batch.hits { hits[hit.message.id] = hit }
+            let roots = hits.values.filter { rootMatches($0.message, hint) }
+            if roots.count == 1, complete, let hit = roots.first {
+                return ThreadResolution(candidates: [ThreadCandidate(root: hit.message, chat: hit.chat, replyVerified: false)], complete: true)
             }
-            if token != nil { complete = false }
+            if !roots.isEmpty { break }
         }
-        let relevant = hits.values.filter { hit in
-            hit.message.isThreadRoot ? rootMatches(hit.message, hint) : replyMatches(hit.message, hint, bounds: bounds)
+        if !hits.values.contains(where: { rootMatches($0.message, hint) }), let query = replyQueries.first {
+            let batch = try await search(query, start: bounds?.start, end: bounds?.end)
+            complete = complete && batch.complete
+            for hit in batch.hits { hits[hit.message.id] = hit }
         }
+        let roots = hits.values.filter { rootMatches($0.message, hint) }
+        let relevant = roots.isEmpty ? hits.values.filter { replyMatches($0.message, hint, bounds: bounds) } : roots
         let groups = Dictionary(grouping: relevant) { $0.chat.id + ":" + ($0.message.threadID ?? "") }
         if groups.count > maximumCandidates { complete = false }
         var candidates: [ThreadCandidate] = []
@@ -132,27 +136,63 @@ struct ThreadResolver: Sendable {
                 if root == nil { complete = false; continue }
             }
             guard let discovered = root else { continue }
-            // Re-read by message ID; search snapshots and cached summaries can be stale.
-            let details = try await run(.messageDetails(messageID: discovered.id))
-            guard let fresh = try LarkCLIParser.messages(from: details.data, fallbackChatID: first.chat.id)
-                .first(where: { $0.id == discovered.id && $0.chatID == first.chat.id && $0.threadID == threadID && $0.isThreadRoot }),
-                  rootMatches(fresh, hint) else { continue }
+            // Search already hydrates messages via mget. Repeating that read adds
+            // latency without strengthening identity within this single attempt.
+            let fresh = discovered
+            guard rootMatches(fresh, hint) else { continue }
             var verified = false
+            var loadedReplies: [LarkMessage] = []
             var token: String?
             var seen = Set<String>()
             for _ in 0..<maximumPages {
                 let result = try await run(.threadMessages(threadID: threadID, pageToken: token, pageSize: 50))
                 let page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: first.chat.id)
+                let replies = page.messages.filter { $0.threadID == threadID && $0.chatID == first.chat.id && !$0.isThreadRoot && !$0.deleted }
+                loadedReplies = MessageTimeline.merging(replies, into: loadedReplies)
                 verified = page.messages.contains { $0.threadID == threadID && $0.chatID == first.chat.id && replyMatches($0, hint, bounds: bounds) }
                 token = page.nextPageToken
                 if verified || token == nil { break }
                 if !seen.insert(token!).inserted { break }
             }
             if !verified && token != nil { complete = false }
-            candidates.append(ThreadCandidate(root: fresh, chat: first.chat, replyVerified: verified))
+            var hydratedRoot = fresh
+            hydratedRoot.threadReplies = loadedReplies.sorted(by: LarkMessage.isChronologicallyBefore)
+            hydratedRoot.threadRepliesLoaded = true
+            hydratedRoot.threadHasMore = token != nil
+            candidates.append(ThreadCandidate(root: hydratedRoot, chat: first.chat, replyVerified: verified))
         }
         try Task.checkCancellation()
         return ThreadResolution(candidates: candidates, complete: complete)
+    }
+
+    private struct SearchBatch: Sendable {
+        var hits: [MessageSearchHit] = []
+        var complete = true
+    }
+
+    private func search(_ query: String, start: String?, end: String?) async throws -> SearchBatch {
+        var batch = SearchBatch()
+        var token: String?
+        var seen = Set<String>()
+        for _ in 0..<maximumPages {
+            try Task.checkCancellation()
+            let result = try await run(.searchMessages(query: query, pageToken: token, start: start, end: end, pageSize: 50))
+            let page = try LarkCLIParser.messageSearchPage(from: result.data)
+            let envelope = try JSONSerialization.jsonObject(with: result.data) as? [String: Any]
+            let payload = envelope?["data"] as? [String: Any] ?? envelope
+            let rawCount = (payload?["messages"] as? [Any])?.count ?? 0
+            if rawCount != page.hits.count || (payload?["has_more"] as? Bool == true && page.nextPageToken == nil) {
+                batch.complete = false
+            }
+            let trigger = LarkPeekDiagnostics.triggerID ?? "none"
+            LarkPeekDiagnostics.threadMatching.info("event=thread_search_page trigger=\(trigger, privacy: .public) raw=\(rawCount) parsed=\(page.hits.count) hasMore=\(page.nextPageToken != nil)")
+            batch.hits += page.hits.filter { $0.message.threadID != nil && !$0.message.deleted }
+            token = page.nextPageToken
+            guard let next = token else { break }
+            if !seen.insert(next).inserted { break }
+        }
+        if token != nil { batch.complete = false }
+        return batch
     }
 
     private func rootMatches(_ message: LarkMessage, _ hint: ThreadRowHint) -> Bool {
@@ -160,7 +200,7 @@ struct ThreadResolver: Sendable {
               ThreadText.normalized(message.sender.name) == ThreadText.normalized(hint.rootSender) else { return false }
         if hint.rootExcerpt == "[会话记录]" { return message.type == "merge_forward" }
         if hint.rootExcerpt == "[图片]" { return message.type == "image" }
-        return ThreadText.matches(excerpt: hint.rootExcerpt, content: message.content)
+        return ThreadText.matches(excerpt: hint.rootExcerpt, content: message.content, allowsLongPrefix: true)
     }
 
     private func replyMatches(_ message: LarkMessage, _ hint: ThreadRowHint, bounds: ActivityBounds?) -> Bool {

@@ -622,8 +622,12 @@ private struct PeekPanelView: View {
     private func loadingView(_ conversation: HoveredConversation) -> some View {
         VStack(spacing: 14) {
             ProgressView().controlSize(.large)
-            Text("正在读取“\(conversation.name)”")
+            Text(conversation.hasThreadAvatar || conversation.threadHint != nil ? "正在加载话题…" : "正在读取会话…")
                 .font(.headline)
+            Text(conversation.name)
+                .font(.subheadline).foregroundStyle(.secondary)
+                .lineLimit(2).truncationMode(.tail)
+                .multilineTextAlignment(.center).padding(.horizontal, 24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
