@@ -27,6 +27,7 @@ public final class MessageTimelineController: NSViewController, NSCollectionView
     var reduceMotionOverride: Bool?
     var isAnimatingExpansion: Bool { heightTransition != nil }
     private let measurementView = NSHostingView(rootView: AnyView(EmptyView()))
+    public var onLoadNewer: (() -> Void)?
     public var onLoadOlder: (() -> Void)?
     public var onPositionChange: ((TimelineReadingPosition) -> Void)?
 
@@ -67,6 +68,11 @@ public final class MessageTimelineController: NSViewController, NSCollectionView
             guard let self, !self.applying, self.sessionID != nil,
                   self.scrollView.contentView.bounds.minY <= 24 else { return }
             self.onLoadOlder?()
+        }
+        scrollView.onDownwardInput = { [weak self] in
+            guard let self, !self.applying, self.sessionID != nil,
+                  self.scrollView.remainingBelow <= 24 else { return }
+            self.onLoadNewer?()
         }
     }
 
@@ -387,9 +393,12 @@ final class TimelineScrollView: NSScrollView {
         set { super.hasHorizontalScroller = false }
     }
 
+    var onDownwardInput: (() -> Void)?
     var onUpwardInput: (() -> Void)?
     var onUserInput: (() -> Void)?
     private var requestedInGesture = false
+    private var requestedNewerInGesture = false
+    var remainingBelow: CGFloat { (documentView?.bounds.height ?? 0) - contentView.bounds.maxY }
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -397,9 +406,15 @@ final class TimelineScrollView: NSScrollView {
         onUserInput?()
         if event.phase.contains(.began) || (event.phase.isEmpty && event.momentumPhase.isEmpty) {
             requestedInGesture = false
+            requestedNewerInGesture = false
         }
         super.scrollWheel(with: event)
         if contentView.bounds.minY > 80 { requestedInGesture = false }
+        if remainingBelow > 80 { requestedNewerInGesture = false }
+        if event.scrollingDeltaY < 0, remainingBelow <= 24, !requestedNewerInGesture {
+            requestedNewerInGesture = true
+            onDownwardInput?()
+        }
         if event.scrollingDeltaY > 0, contentView.bounds.minY <= 24, !requestedInGesture {
             requestedInGesture = true
             onUpwardInput?()
@@ -425,6 +440,7 @@ final class TimelineScrollView: NSScrollView {
         contentView.scroll(to: rect.origin)
         reflectScrolledClipView(contentView)
         if [126, 116, 115].contains(event.keyCode) { onUpwardInput?() }
+        if [125, 121, 119].contains(event.keyCode) { onDownwardInput?() }
     }
 }
 

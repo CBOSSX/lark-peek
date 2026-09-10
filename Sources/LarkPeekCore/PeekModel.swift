@@ -28,6 +28,10 @@ public final class PeekModel: ObservableObject {
     @Published public private(set) var diagnosticTriggerID: String?
     @Published public private(set) var previewNotice: String?
     @Published public private(set) var isCachedPreview = false
+    @Published public private(set) var newerPagination: TimelinePagination = .exhausted
+    public var isSearchContext: Bool { searchHit != nil }
+    private var newerConsumedTokens: Set<String> = []
+    private var contextStart: String?
     private var contextEnd: String?
     private var searchHit: MessageSearchHit?
     public private(set) var readingState = PreviewReadingState()
@@ -280,6 +284,35 @@ public final class PeekModel: ObservableObject {
         isCachedPreview = false
     }
 
+    public struct PreviewSnapshot {
+        fileprivate let conversation: HoveredConversation
+        fileprivate let chat: LarkChat
+        fileprivate let messages: [LarkMessage]
+        fileprivate let pagination: TimelinePagination
+        fileprivate let replyErrors: [String: String]
+        fileprivate let reading: PreviewReadingState
+        fileprivate let notice: String?
+        fileprivate let cached: Bool
+    }
+
+    public func capturePreview() -> PreviewSnapshot? {
+        guard !isSearchContext, let conversation = timeline.conversation, let chat = timeline.chat else { return nil }
+        return PreviewSnapshot(conversation: conversation, chat: chat, messages: timeline.messages,
+            pagination: timeline.pagination, replyErrors: timeline.replyErrors, reading: readingState,
+            notice: previewNotice, cached: isCachedPreview)
+    }
+
+    public func restorePreview(_ snapshot: PreviewSnapshot) {
+        state = .loading(snapshot.conversation)
+        resetTimeline()
+        readingState = snapshot.reading
+        previewNotice = snapshot.notice
+        isCachedPreview = snapshot.cached
+        timeline.restore(conversation: snapshot.conversation, chat: snapshot.chat, messages: snapshot.messages,
+            pagination: snapshot.pagination, replyErrors: snapshot.replyErrors)
+        if let client { scheduleEnrichment(using: client) }
+    }
+
     public func searchMessages(_ command: ReadOnlyCommand) async throws -> MessageSearchPage {
         guard case .searchMessages = command else { throw CommandPolicyError.invalidQuery }
         // Capture known names before awaiting: the user may navigate while search is running.
@@ -290,6 +323,11 @@ public final class PeekModel: ObservableObject {
     }
 
     public func previewSearchHit(_ hit: MessageSearchHit) async {
+        let sessionID = prepareSearchHit(hit)
+        await loadSearchContext(hit, sessionID: sessionID)
+    }
+
+    public func prepareSearchHit(_ hit: MessageSearchHit) -> UUID {
         saveCachedPreview()
         let conversation = HoveredConversation(name: hit.chat.name, rowFrame: .zero, rowTexts: [])
         state = .loading(conversation)
@@ -298,24 +336,67 @@ public final class PeekModel: ObservableObject {
         searchHit = hit
         contextEnd = ISO8601DateFormatter().string(from: hit.message.createTime.addingTimeInterval(1))
             .replacingOccurrences(of: "Z", with: "+00:00")
-        previewNotice = "搜索命中及此前消息"
+        contextStart = ISO8601DateFormatter().string(from: hit.message.createTime)
+            .replacingOccurrences(of: "Z", with: "+00:00")
+        readingState.position = TimelineReadingPosition(messageID: hit.message.id, screenY: 100, isAtBottom: false)
+        previewNotice = "搜索命中及前后消息"
         isCachedPreview = false
+        return timeline.id
+    }
+
+    public func loadSearchContext(_ hit: MessageSearchHit, sessionID: UUID) async {
+        guard timeline.isCurrent(sessionID), searchHit?.id == hit.id,
+              case let .loading(conversation) = state else { return }
         await timeline.schedule(key: "initial") { [weak self] in
             guard let self else { return }
             let sessionID = self.timeline.id
-            // Show the exact hit immediately, even if its surrounding history cannot be loaded.
-            self.timeline.install(conversation: conversation, chat: hit.chat, messages: [hit.message], cursor: nil, sessionID: sessionID)
             do {
                 let client = try self.requireClient()
-                let result = try await client.run(.recentMessages(chatID: hit.chat.id, pageSize: 20, end: self.contextEnd))
+                // Keep the loading page until both sides are ready, then transition once.
+                let before = try await client.run(.recentMessages(chatID: hit.chat.id, pageSize: 20, end: self.contextEnd))
                 try self.timeline.checkCurrentRequest()
-                let page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: hit.chat.id)
+                let after = try await client.run(.recentMessages(chatID: hit.chat.id, pageSize: 20, start: self.contextStart))
+                try self.timeline.checkCurrentRequest()
+                let older = try LarkCLIParser.messagePage(from: before.data, fallbackChatID: hit.chat.id)
+                let newer = try LarkCLIParser.messagePage(from: after.data, fallbackChatID: hit.chat.id)
+                self.newerPagination = newer.nextPageToken.map(TimelinePagination.ready) ?? .exhausted
                 self.timeline.install(conversation: conversation, chat: hit.chat,
-                    messages: MessageTimeline.merging(page.messages, into: [hit.message]), cursor: page.nextPageToken, sessionID: sessionID)
+                    messages: MessageTimeline.merging(older.messages + newer.messages, into: [hit.message]),
+                    cursor: older.nextPageToken, sessionID: sessionID)
                 self.scheduleEnrichment(using: client)
             } catch {
                 guard self.timeline.isCurrent(sessionID), !Task.isCancelled else { return }
                 self.previewNotice = "已显示命中消息；上下文加载失败，可刷新重试"
+                self.newerPagination = .paused(nil, "上下文未加载，请刷新重试")
+                self.timeline.install(conversation: conversation, chat: hit.chat, messages: [hit.message], cursor: nil, sessionID: sessionID)
+            }
+        }.value
+    }
+
+    public func loadNewerMessages(automatic: Bool = false) async {
+        await timeline.schedule(key: "newer-page") { [weak self] in
+            guard let self, let chat = self.timeline.chat, let start = self.contextStart,
+                  let cursor = self.newerPagination.cursor, !self.newerPagination.isLoading,
+                  !automatic || self.newerPagination.allowsAutomaticLoading else { return }
+            let sessionID = self.timeline.id
+            self.newerPagination = .loading(UUID(), cursor)
+            do {
+                let client = try self.requireClient()
+                let result = try await client.run(.recentMessages(chatID: chat.id, pageToken: cursor, pageSize: 20, start: start))
+                try self.timeline.checkCurrentRequest()
+                let page = try LarkCLIParser.messagePage(from: result.data, fallbackChatID: chat.id)
+                self.newerConsumedTokens.insert(cursor)
+                if let next = page.nextPageToken {
+                    self.newerPagination = self.newerConsumedTokens.contains(next)
+                        ? .paused(nil, "分页游标没有前进，请刷新重试") : .ready(next)
+                } else {
+                    self.newerPagination = .exhausted
+                }
+                self.timeline.appendMessages(page.messages, sessionID: sessionID)
+                self.scheduleEnrichment(using: client)
+            } catch {
+                guard self.timeline.isCurrent(sessionID), !Task.isCancelled else { return }
+                self.newerPagination = .failed(cursor, error.localizedDescription)
             }
         }.value
     }
@@ -625,6 +706,11 @@ public final class PeekModel: ObservableObject {
     }
 
     private func resetTimeline() {
+        searchHit = nil
+        contextEnd = nil
+        contextStart = nil
+        newerPagination = .exhausted
+        newerConsumedTokens = []
         timeline.reset()
     }
 

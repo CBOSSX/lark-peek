@@ -128,7 +128,7 @@ private actor ThreadTransport {
             rows = mode == .replyOnly || mode == .withRootID || mode == .missingRoot ? [reply()] : [root(), reply()]
             if mode == .ambiguous { rows += [root(suffix: "2"), reply(suffix: "2")] }
             more = mode == .incomplete || mode == .missingCursor
-        case let .recentMessages(chatID, _, _, _):
+        case let .recentMessages(chatID, _, _, _, _):
             historyRequests += 1
             rows = mode == .missingRoot ? [] : [root(suffix: chatID == "oc_chat2" ? "2" : "")]
         case let .messageDetails(id):

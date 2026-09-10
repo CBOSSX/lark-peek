@@ -74,9 +74,6 @@ struct MessageSearchView: View {
                 }
                 .padding(18)
             }
-            Divider()
-            Text("只读搜索 · 关闭预览后清除本次查询")
-                .font(.caption).foregroundStyle(.secondary).padding(12)
         }
         .onAppear { searchFocused = isActive }
         .onChange(of: isActive) { _, active in searchFocused = active }

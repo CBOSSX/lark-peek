@@ -19,15 +19,57 @@ import Testing
     let page = try await model.searchMessages(.searchMessages(query: "match"))
     let hit = try #require(page.hits.first)
     await model.previewSearchHit(hit)
-    #expect(model.timeline.messages.map(\.id) == ["om_previous", "om_match"])
+    #expect(model.timeline.messages.map(\.id) == ["om_previous", "om_match", "om_after"])
     await model.loadOlderMessages()
-    #expect(model.timeline.messages.map(\.id) == ["om_older", "om_previous", "om_match"])
+    #expect(model.timeline.messages.map(\.id) == ["om_older", "om_previous", "om_match", "om_after"])
+    await model.loadNewerMessages()
+    #expect(model.timeline.messages.map(\.id) == ["om_older", "om_previous", "om_match", "om_after", "om_latest"])
+    #expect(model.newerPagination == .exhausted)
+    #expect(model.readingState.position?.messageID == "om_match")
     await model.retryCurrent()
     let commands = try String(contentsOf: fixture.commands, encoding: .utf8).split(separator: "\n")
-    #expect(commands.count == 3)
-    #expect(commands.allSatisfy { $0.contains("--end 2023-11-14T22:13:21+00:00") })
-    #expect(commands[1].contains("--page-token next"))
+    #expect(commands.count == 6)
+    #expect(commands.filter { $0.contains("--order desc") }.allSatisfy { $0.contains("--end 2023-11-14T22:13:21+00:00") })
+    #expect(commands.filter { $0.contains("--order asc") }.allSatisfy { $0.contains("--start 2023-11-14T22:13:20+00:00") })
+    #expect(commands[2].contains("--page-token next"))
     #expect(model.timeline.messages.contains { $0.id == "om_match" })
+}
+
+@Test @MainActor func newerContextRetriesFailuresStopsCursorCyclesAndResetsOnExit() async throws {
+    let fixture = try ContextFixture()
+    defer { fixture.remove() }
+    let model = PeekModel(defaults: fixture.defaults, workingDirectory: fixture.directory)
+    let hit = try #require(try await model.searchMessages(.searchMessages(query: "match")).hits.first)
+    await model.previewSearchHit(hit)
+    let olderState = model.timeline.pagination
+    let fail = fixture.directory.appendingPathComponent("fail-newer")
+    try Data().write(to: fail)
+    await model.loadNewerMessages()
+    guard case .failed = model.newerPagination else { Issue.record("Expected retryable newer failure"); return }
+    #expect(model.timeline.pagination == olderState)
+    try FileManager.default.removeItem(at: fail)
+    try Data().write(to: fixture.directory.appendingPathComponent("cycle-newer"))
+    await model.loadNewerMessages()
+    #expect(model.newerPagination.cursor == nil)
+    guard case .paused = model.newerPagination else { Issue.record("Expected cyclic cursor to stop"); return }
+    #expect(model.timeline.messages.filter { $0.id == "om_match" }.count == 1)
+    #expect(model.timeline.pagination == olderState)
+    model.dismiss()
+    #expect(!model.isSearchContext && model.newerPagination == .exhausted)
+}
+
+@Test @MainActor func aPreparedContextCannotLoadAfterAnotherNavigation() async throws {
+    let fixture = try ContextFixture()
+    defer { fixture.remove() }
+    let model = PeekModel(defaults: fixture.defaults, workingDirectory: fixture.directory)
+    let page = try await model.searchMessages(.searchMessages(query: "match"))
+    let hit = try #require(page.hits.first)
+    let session = model.prepareSearchHit(hit)
+    guard case .loading = model.state else { Issue.record("Preparation must synchronously enter loading"); return }
+    model.dismiss()
+    await model.loadSearchContext(hit, sessionID: session)
+    #expect(model.state == .waiting)
+    #expect(!FileManager.default.fileExists(atPath: fixture.commands.path))
 }
 
 @Test @MainActor func revisitingAChatUsesMemoryButRefreshFetchesNewData() async throws {
@@ -78,6 +120,17 @@ import Testing
           *" +chat-messages-list "*)
             printf '%s\\n' "$*" >> '\(commands.path)'
             case " $* " in
+              *" --page-token later "*)
+                if [ -f '\(directory.path)/fail-newer' ]; then exit 1; fi
+                if [ -f '\(directory.path)/cycle-newer' ]; then
+                  printf '%s' '{"ok":true,"data":{"messages":[],"has_more":true,"page_token":"later"}}'
+                  exit 0
+                fi
+                printf '%s' '{"ok":true,"data":{"messages":[{"message_id":"om_latest","create_time":"1700000200000","content":"latest"}],"has_more":false}}'
+                ;;
+              *" --order asc "*)
+                printf '%s' '{"ok":true,"data":{"messages":[{"message_id":"om_match","create_time":"1700000000000","content":"match"},{"message_id":"om_after","create_time":"1700000100000","content":"after"}],"has_more":true,"page_token":"later"}}'
+                ;;
               *" --page-token next "*)
                 printf '%s' '{"ok":true,"data":{"messages":[{"message_id":"om_older","create_time":"1699999800000","content":"older"}],"has_more":false}}'
                 ;;

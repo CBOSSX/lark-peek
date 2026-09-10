@@ -27,6 +27,10 @@ import Testing
     let arguments = try ReadOnlyCommand.recentMessages(chatID: "oc_safe", pageToken: "next", end: end).arguments()
     #expect(arguments.suffix(4) == ["--end", end, "--page-token", "next"])
     #expect(throws: (any Error).self) { try ReadOnlyCommand.recentMessages(chatID: "oc_safe", end: "--yes").arguments() }
+    let newer = try ReadOnlyCommand.recentMessages(chatID: "oc_safe", pageToken: "later", start: end).arguments()
+    #expect(newer.contains("asc"))
+    #expect(newer.suffix(4) == ["--start", end, "--page-token", "later"])
+    #expect(throws: (any Error).self) { try ReadOnlyCommand.recentMessages(chatID: "oc_safe", start: "--yes").arguments() }
     #expect(LarkAppLink.chat("oc_safe&openId=bad") == nil)
     #expect(LarkAppLink.chat("oc_safe")?.absoluteString == "https://applink.feishu.cn/client/chat/open?openChatId=oc_safe")
 }

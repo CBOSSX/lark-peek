@@ -303,6 +303,30 @@ struct MessageTimelineTests {
         #expect(requests == 1)
     }
 
+    @Test func downwardWheelLoadsOnlyAtBottomAndAppendingKeepsTheAnchor() throws {
+        let fixture = WindowFixture()
+        defer { fixture.close() }
+        var requests = 0
+        fixture.controller.onLoadNewer = { requests += 1 }
+        fixture.controller.update(sessionID: fixture.id, rows: rows(0..<20))
+        fixture.layout()
+        #expect(requests == 0)
+        let cgEvent = try #require(CGEvent(scrollWheelEvent2Source: nil,
+            units: .pixel, wheelCount: 1, wheel1: -10, wheel2: 0, wheel3: 0))
+        let event = try #require(NSEvent(cgEvent: cgEvent))
+        fixture.scroll(to: 100)
+        fixture.controller.scrollView.scrollWheel(with: event)
+        #expect(requests == 0)
+        fixture.scroll(to: fixture.controller.timelineLayout.collectionViewContentSize.height)
+        fixture.controller.scrollView.scrollWheel(with: event)
+        #expect(requests == 1)
+        let before = fixture.screenY(at: 19)
+        fixture.controller.update(sessionID: fixture.id, rows: rows(0..<40))
+        fixture.layout()
+        #expect(abs(fixture.screenY(at: 19) - before) <= 1)
+        #expect(requests == 1)
+    }
+
     @Test func aThousandLoadedMessagesKeepTheVisibleViewCountBounded() throws {
         let fixture = WindowFixture()
         defer { fixture.close() }

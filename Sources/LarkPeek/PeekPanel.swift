@@ -29,6 +29,9 @@ private final class PanelPresentation: ObservableObject {
     @Published var isSearching = false
     @Published var searchSessionID: UUID?
     var searchChat: LarkChat?
+    @Published var searchOrigin: PeekModel.PreviewSnapshot?
+    @Published var isShowingSearchContext = false
+    var canGoBack: Bool { isSearching ? searchOrigin != nil : isShowingSearchContext }
     /// Offset of the card within the window while the window is enlarged to give
     /// the fly-in animation room to render past the card's resting frame.
     @Published var cardOffset: CGSize = .zero
@@ -94,7 +97,7 @@ final class PeekPanelController {
                 if let onCloseRequested = self.onCloseRequested { onCloseRequested() } else { self.close() }
             },
             onPin: { [weak self] in self?.setPinned(!(self?.isPinned ?? false)) },
-            onBack: { [weak self] in self?.toggleSearchPage() },
+            onBack: { [weak self] in self?.goBack() },
             onSearchResult: { [weak self] in self?.onSearchResult?($0) },
             onSearch: { [weak self] in self?.onSearch?() },
             onSelect: { [weak model] chat, conversation in
@@ -129,6 +132,8 @@ final class PeekPanelController {
         lastTriggerID = triggerID
         presentation.isSearching = false
         presentation.searchSessionID = nil
+        presentation.searchOrigin = nil
+        presentation.isShowingSearchContext = false
         search.clear()
         if preservePosition, panel.isVisible, !lastCardFrame.isEmpty {
             presentation.isPresented = true
@@ -210,6 +215,8 @@ final class PeekPanelController {
             self.model.dismiss()
             self.search.clear()
             self.presentation.searchSessionID = nil
+            self.presentation.searchOrigin = nil
+            self.presentation.isShowingSearchContext = false
             self.presentation.isSearching = false
             self.closeTask = nil
             self.lastTriggerID = nil
@@ -240,8 +247,15 @@ final class PeekPanelController {
             show(anchor: anchor, triggerID: "search")
         }
         dismissPresentedImage()
+        if currentChat != nil, model.isSearchContext, presentation.searchSessionID != nil {
+            presentation.isShowingSearchContext = false
+            presentation.isSearching = true
+            panel.makeKeyAndOrderFront(nil)
+            return
+        }
         if presentation.searchSessionID == nil || presentation.searchChat?.id != currentChat?.id {
             search.clear()
+            presentation.searchOrigin = currentChat == nil ? nil : model.capturePreview()
             presentation.searchChat = currentChat
             presentation.searchSessionID = UUID()
         }
@@ -251,13 +265,39 @@ final class PeekPanelController {
         panel.makeKeyAndOrderFront(nil)
     }
 
-    func toggleSearchPage() {
-        guard presentation.searchSessionID != nil else { return }
-        presentation.isSearching.toggle()
-        if presentation.isSearching { panel.makeKey() }
+    var canGoBack: Bool { presentation.canGoBack }
+
+    func goBack() {
+        guard presentation.canGoBack else { return }
+        if presentation.isSearching {
+            let origin = presentation.searchOrigin
+            presentation.searchSessionID = nil
+            presentation.searchOrigin = nil
+            presentation.isShowingSearchContext = false
+            presentation.isSearching = false
+            search.clear()
+            if model.isSearchContext, let origin {
+                model.restorePreview(origin)
+            }
+        } else {
+            presentation.isShowingSearchContext = false
+            presentation.isSearching = true
+            panel.makeKey()
+        }
+    }
+
+    func prepareSearchResult(_ hit: MessageSearchHit) -> UUID {
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        let sessionID = withTransaction(transaction) {
+            model.prepareSearchHit(hit)
+        }
+        showSearchResult()
+        return sessionID
     }
 
     func showSearchResult() {
+        presentation.isShowingSearchContext = true
         presentation.isSearching = false
     }
 
@@ -468,7 +508,7 @@ private struct PeekPanelView: View {
             Image(systemName: "eye.circle.fill")
                 .font(.system(size: 22, weight: .semibold))
                 .foregroundStyle(.blue.gradient)
-            if presentation.searchSessionID != nil, !presentation.isSearching || model.state != .waiting {
+            if presentation.canGoBack {
                 Button(action: onBack) {
                     Image(systemName: "chevron.left")
                         .font(.system(size: 13, weight: .medium))

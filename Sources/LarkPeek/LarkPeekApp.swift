@@ -331,10 +331,10 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         model.invalidatePreviewRequests()
         let triggerID = LarkPeekDiagnostics.makeTriggerID()
         activeTriggerID = triggerID
-        panelController.showSearchResult()
+        let sessionID = panelController.prepareSearchResult(hit)
         peekTask = Task { [weak self] in
             guard !Task.isCancelled else { return }
-            await self?.model.previewSearchHit(hit)
+            await self?.model.loadSearchContext(hit, sessionID: sessionID)
         }
     }
 

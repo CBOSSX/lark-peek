@@ -30,6 +30,11 @@ public struct MessageTimelineView: View {
             initialPosition: readingState.position, onPositionChange: {
                 guard model.timeline.id == sessionID else { return }
                 readingState.position = $0
+            }, onLoadNewer: {
+                Task {
+                    guard model.timeline.id == sessionID, model.timeline.revision == revision else { return }
+                    await model.loadNewerMessages(automatic: true)
+                }
             }) {
             Task {
                 guard model.timeline.id == sessionID, model.timeline.revision == revision else { return }
@@ -71,7 +76,29 @@ public struct MessageTimelineView: View {
                 messageRow(message).transaction { $0.disablesAnimations = true }
             ), expansionVersion: expansionVersion)
         }
+        if model.isSearchContext {
+            rows.append(TimelineRow(id: "timeline-newer", version: model.newerPagination, content: AnyView(newerPaginationRow)))
+        }
         return rows
+    }
+
+    private var newerPaginationRow: some View {
+        HStack(spacing: 6) {
+            switch model.newerPagination {
+            case .ready:
+                Text("继续向下滚动加载更多消息")
+            case .loading:
+                ProgressView().controlSize(.mini)
+                Text("正在加载更新消息…")
+            case let .failed(_, reason):
+                Text("加载失败").help(reason)
+                Button("重试") { Task { await model.loadNewerMessages() } }
+            case let .paused(_, reason): Text(reason)
+            case .exhausted: Text("已到最新消息")
+            }
+        }
+        .buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity).frame(height: 28)
     }
 
     private var paginationRow: some View {

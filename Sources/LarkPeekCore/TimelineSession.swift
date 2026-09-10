@@ -80,6 +80,27 @@ public final class TimelineSession {
         changed()
     }
 
+    func restore(conversation: HoveredConversation, chat: LarkChat, messages: [LarkMessage],
+                 pagination: TimelinePagination, replyErrors: [String: String]) {
+        self.conversation = conversation
+        self.chat = chat
+        self.messages = messages
+        // The old request was cancelled when entering context; allow it to be retried.
+        if case let .loading(_, cursor) = pagination {
+            self.pagination = .ready(cursor)
+        } else {
+            self.pagination = pagination
+        }
+        self.replyErrors = replyErrors
+        changed()
+    }
+
+    func appendMessages(_ incoming: [LarkMessage], sessionID: UUID) {
+        guard isCurrent(sessionID) else { return }
+        messages = MessageTimeline.merging(incoming, into: messages)
+        changed()
+    }
+
     func beginPage(sessionID: UUID, automatic: Bool) -> (id: UUID, cursor: String)? {
         guard isCurrent(sessionID), !pagination.isLoading,
               !automatic || pagination.allowsAutomaticLoading,
