@@ -251,6 +251,7 @@ public enum LarkCLIParser {
             forwardedMessages: deleted ? [] : parsedContent.forwardedMessages,
             threadID: threadID,
             isThreadRoot: isThreadRoot,
+            rootID: (row["root_id"] as? String).flatMap { $0.hasPrefix("om_") ? $0 : nil },
             deleted: deleted,
             updated: row["updated"] as? Bool ?? false
         )

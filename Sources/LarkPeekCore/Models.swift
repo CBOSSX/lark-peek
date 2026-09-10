@@ -104,6 +104,7 @@ public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
     public var calendarShare: CalendarShare?
     public var forwardedMessages: [ForwardedMessageItem]
     public var threadID: String?
+    public var rootID: String?
     public var isThreadRoot: Bool
     public var threadReplies: [LarkMessage]
     public var threadRepliesLoaded: Bool
@@ -126,6 +127,7 @@ public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
         forwardedMessages: [ForwardedMessageItem] = [],
         threadID: String? = nil,
         isThreadRoot: Bool? = nil,
+        rootID: String? = nil,
         threadReplies: [LarkMessage] = [],
         threadRepliesLoaded: Bool = false,
         threadHasMore: Bool = false,
@@ -145,6 +147,7 @@ public struct LarkMessage: Identifiable, Codable, Hashable, Sendable {
         self.calendarShare = calendarShare
         self.forwardedMessages = forwardedMessages
         self.threadID = threadID
+        self.rootID = rootID
         self.isThreadRoot = isThreadRoot ?? (threadID != nil)
         self.threadReplies = threadReplies
         self.threadRepliesLoaded = threadRepliesLoaded
@@ -233,18 +236,23 @@ public struct HoveredConversation: Equatable, Sendable {
     public let name: String
     public let rowFrame: CGRect
     public let rowTexts: [String]
+    public let hasThreadAvatar: Bool
+    public let structuredThreadHint: ThreadRowHint?
 
-    public init(name: String, rowFrame: CGRect, rowTexts: [String]) {
+    public init(name: String, rowFrame: CGRect, rowTexts: [String], hasThreadAvatar: Bool = false, structuredThreadHint: ThreadRowHint? = nil) {
         self.name = name
         self.rowFrame = rowFrame
         self.rowTexts = rowTexts
+        self.hasThreadAvatar = hasThreadAvatar
+        self.structuredThreadHint = structuredThreadHint
     }
 
     public var fingerprint: String {
-        ConversationText.normalize([name] + rowTexts.prefix(5))
+        String(hasThreadAvatar) + ConversationText.normalize([name] + rowTexts.prefix(5))
     }
 
     public var threadHint: ThreadRowHint? {
+        if hasThreadAvatar, let structuredThreadHint { return structuredThreadHint }
         guard let hint = ThreadRowHeuristics.hint(from: rowTexts.isEmpty ? [name] : rowTexts),
               ThreadRowHeuristics.matchesConversationTitle(name, hint: hint)
         else { return nil }
@@ -301,6 +309,26 @@ public enum ThreadRowHeuristics {
     private static let replySenderPattern = try! NSRegularExpression(
         pattern: #"^\s*([^:：\n]{1,40}?)\s*[:：](?!\d)\s*"#
     )
+
+    public static func hint(title: String, activity: String, replyTexts: [String]) -> ThreadRowHint? {
+        let range = NSRange(title.startIndex..<title.endIndex, in: title)
+        guard let match = rootSenderPattern.firstMatch(in: title, range: range),
+              let sender = capture(1, match: match, in: title),
+              let end = Range(match.range, in: title)?.upperBound else { return nil }
+        let root = String(title[end...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let reply = replyTexts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        let replyRange = NSRange(reply.startIndex..<reply.endIndex, in: reply)
+        let replyMatch = replySenderPattern.firstMatch(in: reply, range: replyRange)
+        let replySender = replyMatch.flatMap { capture(1, match: $0, in: reply) }
+        let body: String
+        if let replyMatch, let end = Range(replyMatch.range, in: reply)?.upperBound {
+            body = String(reply[end...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else { body = reply }
+        guard !root.isEmpty, !body.isEmpty else { return nil }
+        return ThreadRowHint(rootSender: sender, rootExcerpt: root, latestReplySender: replySender,
+                             latestReplyExcerpt: body, searchQuery: searchQuery(from: root) ?? root,
+                             replySearchQuery: searchQuery(from: body), activityMarker: activity)
+    }
 
     public static func hint(from texts: [String]) -> ThreadRowHint? {
         // Accessibility exposes the same Feishu row differently across builds:
@@ -440,28 +468,6 @@ public struct ThreadSearchHit: Equatable, Sendable {
     public init(rootMessage: LarkMessage, chat: LarkChat) {
         self.rootMessage = rootMessage
         self.chat = chat
-    }
-}
-
-public enum ThreadSearchMatcher {
-    public static func bestHit(for hint: ThreadRowHint, in hits: [ThreadSearchHit]) -> ThreadSearchHit? {
-        let scored = hits.compactMap { hit -> (ThreadSearchHit, Int)? in
-            guard hit.rootMessage.threadID != nil else { return nil }
-            let content = ConversationText.normalize(hit.rootMessage.content)
-            let query = ConversationText.normalize(hint.searchQuery)
-            let excerpt = ConversationText.normalize(hint.rootExcerpt)
-            let senderMatches = ConversationText.normalize(hit.rootMessage.sender.name)
-                == ConversationText.normalize(hint.rootSender)
-            var score = 0
-            if !query.isEmpty, content.contains(query) { score += 4 }
-            if !excerpt.isEmpty, excerpt.contains(content) || content.contains(excerpt) { score += 2 }
-            if senderMatches { score += 2 }
-            guard score >= 6 else { return nil }
-            return (hit, score)
-        }
-        guard let highest = scored.map(\.1).max() else { return nil }
-        let winners = scored.filter { $0.1 == highest }
-        return winners.count == 1 ? winners[0].0 : nil
     }
 }
 

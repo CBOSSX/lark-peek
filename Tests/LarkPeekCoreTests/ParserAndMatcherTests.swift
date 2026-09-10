@@ -470,36 +470,6 @@ import Testing
     #expect(groupNameContainingColon.threadHint == nil)
 }
 
-@Test func threadSearchMatcherRequiresOneHighConfidenceThread() throws {
-    let hint = try #require(ThreadRowHeuristics.hint(from: [
-        "曹沙沙: 辛苦大家更新下各业务线开发进展 14:12 田阁良: 已更新"
-    ]))
-    let matching = ThreadSearchHit(
-        rootMessage: LarkMessage(
-            id: "om_root",
-            chatID: "oc_group",
-            createTime: .now,
-            sender: MessageSender(name: "曹沙沙"),
-            content: "辛苦大家更新下各业务线开发进展",
-            threadID: "omt_topic"
-        ),
-        chat: LarkChat(id: "oc_group", name: "业务群", kind: .group)
-    )
-    let noThread = ThreadSearchHit(
-        rootMessage: LarkMessage(
-            id: "om_plain",
-            chatID: "oc_group",
-            createTime: .now,
-            sender: MessageSender(name: "曹沙沙"),
-            content: "辛苦大家更新下各业务线开发进展"
-        ),
-        chat: matching.chat
-    )
-
-    #expect(ThreadSearchMatcher.bestHit(for: hint, in: [noThread, matching])?.rootMessage.id == "om_root")
-    #expect(ThreadSearchMatcher.bestHit(for: hint, in: [matching, matching]) == nil)
-}
-
 @Test func larkApplicationIdentityAcceptsElectronHelperProcesses() {
     #expect(LarkApplicationIdentity.matches(bundleIdentifier: "com.electron.lark"))
     #expect(LarkApplicationIdentity.matches(bundleIdentifier: "com.electron.lark.helper"))

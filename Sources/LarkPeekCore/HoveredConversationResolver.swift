@@ -179,7 +179,14 @@ public final class HoveredConversationResolver {
         LarkPeekDiagnostics.accessibility.info(
             "event=resolve_succeeded trigger=\(trigger, privacy: .public) strategy=\(lookup.strategy, privacy: .public) scanned=\(lookup.scanned) nodes=\(records.count) rowWidth=\(frame.width, format: .fixed(precision: 0)) rowHeight=\(frame.height, format: .fixed(precision: 0)) target=\(name, privacy: .private(mask: .hash))"
         )
-        return HoveredConversation(name: name, rowFrame: frame, rowTexts: allTexts)
+        let threadAvatar = hasThreadAvatar(in: row)
+        let activity = topTexts.first {
+            $0.range(of: #"^(\d{1,2}:\d{2}|昨天|前天|\d{1,2}月\d{1,2}日)$"#, options: .regularExpression) != nil
+        }
+        let replyTexts = records.filter { ($0.frame?.midY ?? 0) > topLineLimit }.map(\.text)
+        let structured = activity.flatMap { ThreadRowHeuristics.hint(title: name, activity: $0, replyTexts: replyTexts) }
+        return HoveredConversation(name: name, rowFrame: frame, rowTexts: allTexts,
+                                   hasThreadAvatar: threadAvatar, structuredThreadHint: structured)
     }
 
     private func loggedFailure(
@@ -408,6 +415,18 @@ public final class HoveredConversationResolver {
             ConversationRowGeometry.prefers($1.frame, over: $0.frame)
         }
         return (match, scanned)
+    }
+
+    private func hasThreadAvatar(in row: AXUIElement) -> Bool {
+        var stack: [(AXUIElement, Int)] = [(row, 0)]
+        var scanned = 0
+        while let (element, depth) = stack.popLast(), scanned < 128 {
+            scanned += 1
+            let classes = attribute(element, "AXDOMClassList" as CFString) as? [String] ?? []
+            if ThreadAvatarEvidence.matches(classes: classes) { return true }
+            if depth < 9 { stack.append(contentsOf: children(of: element).map { ($0, depth + 1) }) }
+        }
+        return false
     }
 
     private struct TextRecord {

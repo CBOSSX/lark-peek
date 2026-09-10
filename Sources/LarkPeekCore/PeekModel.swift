@@ -7,16 +7,11 @@ private let chatMatchLogger = LarkPeekDiagnostics.chatMatching
 private let threadMatchLogger = LarkPeekDiagnostics.threadMatching
 private let hoverRouteLogger = LarkPeekDiagnostics.hoverRouting
 
-private struct StoredThreadResolution: Codable {
-    let threadID: String
-    let rootMessageID: String
-    let chat: LarkChat
-}
-
 public enum PeekState: Equatable {
     case waiting
     case loading(HoveredConversation)
     case candidates(HoveredConversation, [LarkChat])
+    case threadCandidates(HoveredConversation, [ThreadCandidate], Bool)
     case messages(HoveredConversation, LarkChat, [LarkMessage], Date)
     case error(HoveredConversation?, String)
 }
@@ -141,59 +136,24 @@ public final class PeekModel: ObservableObject {
                 "event=route_classified trigger=\(trigger, privacy: .public) nodes=\(conversation.rowTexts.count) shape=\(rowShape, privacy: .public) threadHint=\(hint != nil) target=\(conversation.name, privacy: .private(mask: .hash))"
             )
 
-            if let hint {
-                if let stored = rememberedThread(for: hint) {
-                    let cachedRoot = LarkMessage(
-                        id: stored.rootMessageID,
-                        chatID: stored.chat.id,
-                        createTime: Date(),
-                        sender: MessageSender(name: hint.rootSender),
-                        content: hint.rootExcerpt,
-                        threadID: stored.threadID
-                    )
-                    do {
-                        try await loadThread(
-                            root: cachedRoot,
-                            chat: stored.chat,
-                            conversation: conversation,
-                            using: client
-                        )
-                        return
-                    } catch is CancellationError {
-                        return
-                    } catch {
-                        forgetThread(for: hint)
-                        threadMatchLogger.info(
-                            "event=stale_mapping_discarded trigger=\(trigger, privacy: .public) key=\(hint.stableFingerprint, privacy: .private(mask: .hash)) code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)"
-                        )
-                    }
-                }
-
-                do {
-                    if let hit = try await findThread(for: hint, using: client) {
-                        remember(thread: hit, for: hint)
-                        try await loadThread(
-                            root: hit.rootMessage,
-                            chat: hit.chat,
-                            conversation: conversation,
-                            using: client
-                        )
-                        return
-                    }
-                } catch is CancellationError {
-                    return
-                } catch {
-                    threadMatchLogger.info(
-                        "event=fast_path_failed trigger=\(trigger, privacy: .public) query=\(hint.searchQuery, privacy: .private(mask: .hash)) code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)"
-                    )
-                    publishState(.error(conversation, "话题检索失败，请稍后重试。"))
+            if conversation.hasThreadAvatar || hint != nil {
+                guard let hint else {
+                    publishState(.error(conversation, "已识别为话题，但无法读取完整摘要。请在飞书中查看该话题。"))
                     return
                 }
-
-                // This row has the standalone-topic shape. Falling through to
-                // chat/contact matching can open an unrelated P2P conversation
-                // whose name happens to equal the topic author.
-                publishState(.error(conversation, "没有定位到这个话题，请稍后重试。"))
+                let resolution = try await ThreadResolver(run: { try await client.run($0) }).resolve(hint)
+                try timeline.checkCurrentRequest()
+                threadMatchLogger.info("event=thread_resolution trigger=\(trigger, privacy: .public) candidates=\(resolution.candidates.count) complete=\(resolution.complete)")
+                if resolution.complete, resolution.candidates.count == 1,
+                   let candidate = resolution.candidates.first, candidate.replyVerified {
+                    try await loadThread(root: candidate.root, chat: candidate.chat, conversation: conversation, using: client)
+                } else if !resolution.candidates.isEmpty {
+                    publishState(.threadCandidates(conversation, resolution.candidates, resolution.complete))
+                } else {
+                    publishState(.error(conversation, resolution.complete
+                        ? "没有找到与这条摘要对应的话题。消息可能已更新，或尚未被搜索收录。"
+                        : "话题查询尚未完成，未能在本次查询范围内确认。请在飞书中查看，或稍后重试。"))
+                }
                 return
             }
 
@@ -299,7 +259,7 @@ public final class PeekModel: ObservableObject {
         previewCache.removeAll()
         let conversation: HoveredConversation?
         switch state {
-        case let .loading(value), let .candidates(value, _), let .messages(value, _, _, _): conversation = value
+        case let .loading(value), let .candidates(value, _), let .threadCandidates(value, _, _), let .messages(value, _, _, _): conversation = value
         case let .error(value, _): conversation = value
         case .waiting: conversation = nil
         }
@@ -619,144 +579,28 @@ public final class PeekModel: ObservableObject {
         previewCache[chat.id] = (page, cached.date, cached.reading)
     }
 
-    private func findThread(
-        for hint: ThreadRowHint,
-        using client: LarkCLIClient
-    ) async throws -> ThreadSearchHit? {
-        let trigger = LarkPeekDiagnostics.triggerID ?? diagnosticTriggerID ?? "none"
-        try Task.checkCancellation()
-        if hint.searchQuery.count >= 6 {
-            let result = try await client.run(.searchMessages(query: hint.searchQuery, pageSize: 10))
-            let hits = try LarkCLIParser.threadSearchHits(from: result.data)
-            if let matched = ThreadSearchMatcher.bestHit(for: hint, in: hits) {
-                threadMatchLogger.info(
-                    "event=root_query_matched trigger=\(trigger, privacy: .public) query=\(hint.searchQuery, privacy: .private(mask: .hash)) hits=\(hits.count)"
-                )
-                return usingKnownChat(for: matched)
-            }
-            threadMatchLogger.info(
-                "event=root_query_inconclusive trigger=\(trigger, privacy: .public) query=\(hint.searchQuery, privacy: .private(mask: .hash)) hits=\(hits.count)"
-            )
-        }
-
-        guard let replyQuery = hint.replySearchQuery,
-              let bounds = activityDateBounds(for: hint.activityMarker) else { return nil }
-        let replyResult = try await client.run(.searchMessages(
-            query: replyQuery,
-            start: bounds.start,
-            end: bounds.end,
-            pageSize: 50
-        ))
-        let replyHits = try LarkCLIParser.threadSearchHits(from: replyResult.data)
-        let replyCandidates = matchingReplyHits(for: hint, in: replyHits)
-        threadMatchLogger.info(
-            "event=reply_fallback_checked trigger=\(trigger, privacy: .public) query=\(replyQuery, privacy: .private(mask: .hash)) hits=\(replyHits.count) candidates=\(replyCandidates.count)"
-        )
-        if replyCandidates.count == 1, let replyHit = replyCandidates.first {
-            return syntheticRootHit(for: hint, from: replyHit, createTime: bounds.date)
-        }
-
-        let candidateChatIDs = Array(Set(replyCandidates.map(\.chat.id))).sorted()
-        guard !candidateChatIDs.isEmpty else { return nil }
-        let rootResult = try await client.run(.searchMessages(
-            query: hint.searchQuery,
-            chatIDs: candidateChatIDs,
-            start: bounds.start,
-            end: bounds.end,
-            pageSize: 50
-        ))
-        let narrowedHits = try LarkCLIParser.threadSearchHits(from: rootResult.data)
-        let exactRoots = narrowedHits.filter { hit in
-            ConversationText.normalize(hit.rootMessage.sender.name) == ConversationText.normalize(hint.rootSender)
-                && ConversationText.normalize(hit.rootMessage.content) == ConversationText.normalize(hint.rootExcerpt)
-        }
-        guard exactRoots.count == 1, let matched = exactRoots.first else {
-            threadMatchLogger.info(
-                "event=short_root_ambiguous trigger=\(trigger, privacy: .public) chats=\(candidateChatIDs.count) hits=\(narrowedHits.count) exact=\(exactRoots.count)"
-            )
-            return nil
-        }
-        threadMatchLogger.info(
-            "event=short_root_matched trigger=\(trigger, privacy: .public) chats=\(candidateChatIDs.count)"
-        )
-        return usingKnownChat(for: matched)
-    }
-
-    private func usingKnownChat(for hit: ThreadSearchHit) -> ThreadSearchHit {
-        var matched = hit
-        if let knownChat = recentChats.first(where: { $0.id == matched.chat.id }) {
-            matched = ThreadSearchHit(rootMessage: matched.rootMessage, chat: knownChat)
-        }
-        return matched
-    }
-
-    private func matchingReplyHits(
-        for hint: ThreadRowHint,
-        in hits: [ThreadSearchHit]
-    ) -> [ThreadSearchHit] {
-        guard let replyQuery = hint.replySearchQuery else { return [] }
-        let query = ConversationText.normalize(replyQuery)
-        let expectedSender = hint.latestReplySender.map(ConversationText.normalize)
-        var byThreadID: [String: ThreadSearchHit] = [:]
-        for hit in hits {
-            guard let threadID = hit.rootMessage.threadID,
-                  ConversationText.normalize(hit.rootMessage.content).contains(query) else { continue }
-            if let expectedSender,
-               ConversationText.normalize(hit.rootMessage.sender.name) != expectedSender { continue }
-            byThreadID[threadID] = hit
-        }
-        return Array(byThreadID.values)
-    }
-
-    private func syntheticRootHit(
-        for hint: ThreadRowHint,
-        from replyHit: ThreadSearchHit,
-        createTime: Date
-    ) -> ThreadSearchHit {
-        let threadID = replyHit.rootMessage.threadID ?? ""
-        let root = LarkMessage(
-            id: "thread-root-\(threadID)",
-            chatID: replyHit.chat.id,
-            createTime: createTime,
-            sender: MessageSender(name: hint.rootSender),
-            content: hint.rootExcerpt,
-            threadID: threadID
-        )
-        return usingKnownChat(for: ThreadSearchHit(rootMessage: root, chat: replyHit.chat))
-    }
-
-    private func activityDateBounds(for marker: String, now: Date = Date()) -> (date: Date, start: String, end: String)? {
-        let calendar = Calendar.autoupdatingCurrent
-        let today = calendar.startOfDay(for: now)
-        let date: Date?
-        switch marker {
-        case "昨天": date = calendar.date(byAdding: .day, value: -1, to: today)
-        case "前天": date = calendar.date(byAdding: .day, value: -2, to: today)
-        default:
-            if marker.range(of: #"^\d{1,2}:\d{2}$"#, options: .regularExpression) != nil {
-                date = today
-            } else {
-                let parts = marker
-                    .replacingOccurrences(of: "日", with: "")
-                    .split(separator: "月")
-                    .compactMap { Int($0) }
-                guard parts.count == 2 else { return nil }
-                var components = calendar.dateComponents([.year], from: now)
-                components.month = parts[0]
-                components.day = parts[1]
-                guard var candidate = calendar.date(from: components) else { return nil }
-                if candidate > (calendar.date(byAdding: .day, value: 1, to: today) ?? now),
-                   let previousYear = calendar.date(byAdding: .year, value: -1, to: candidate) {
-                    candidate = previousYear
+    public func selectThread(_ candidate: ThreadCandidate, conversation: HoveredConversation) async {
+        guard case let .threadCandidates(current, candidates, _) = state,
+              current == conversation, candidates.contains(candidate) else { return }
+        publishState(.loading(conversation))
+        await timeline.schedule(key: "initial") { [weak self] in
+            guard let self else { return }
+            do {
+                let client = try self.requireClient()
+                let result = try await client.run(.messageDetails(messageID: candidate.root.id))
+                try self.timeline.checkCurrentRequest()
+                guard let root = try LarkCLIParser.messages(from: result.data, fallbackChatID: candidate.chat.id)
+                    .first(where: { $0.id == candidate.root.id && $0.chatID == candidate.chat.id
+                        && $0.threadID == candidate.root.threadID && $0.isThreadRoot && !$0.deleted }) else {
+                    throw LarkCLIError.malformedResponse
                 }
-                date = calendar.startOfDay(for: candidate)
+                try await self.loadThread(root: root, chat: candidate.chat, conversation: conversation, using: client)
+            } catch is CancellationError {
+                return
+            } catch {
+                self.publishState(.error(conversation, error.localizedDescription))
             }
-        }
-        guard let date, let endDate = calendar.date(byAdding: .day, value: 1, to: date) else { return nil }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        formatter.timeZone = .autoupdatingCurrent
-        return (date, formatter.string(from: date), formatter.string(from: endDate))
+        }.value
     }
 
     private func loadThread(
@@ -1025,28 +869,4 @@ public final class PeekModel: ObservableObject {
         defaults.set(chatID, forKey: mappingKey(for: conversation))
     }
 
-    private func threadMappingKey(for hint: ThreadRowHint) -> String {
-        let digest = SHA256.hash(data: Data(hint.stableFingerprint.utf8))
-        return "threadMapping." + digest.map { String(format: "%02x", $0) }.joined()
-    }
-
-    private func rememberedThread(for hint: ThreadRowHint) -> StoredThreadResolution? {
-        guard let data = defaults.data(forKey: threadMappingKey(for: hint)) else { return nil }
-        return try? JSONDecoder().decode(StoredThreadResolution.self, from: data)
-    }
-
-    private func remember(thread hit: ThreadSearchHit, for hint: ThreadRowHint) {
-        guard let threadID = hit.rootMessage.threadID else { return }
-        let stored = StoredThreadResolution(
-            threadID: threadID,
-            rootMessageID: hit.rootMessage.id,
-            chat: hit.chat
-        )
-        guard let data = try? JSONEncoder().encode(stored) else { return }
-        defaults.set(data, forKey: threadMappingKey(for: hint))
-    }
-
-    private func forgetThread(for hint: ThreadRowHint) {
-        defaults.removeObject(forKey: threadMappingKey(for: hint))
-    }
 }

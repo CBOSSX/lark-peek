@@ -36,6 +36,7 @@ public enum ReadOnlyCommand: Equatable, Sendable {
         end: String? = nil,
         pageSize: Int = 10
     )
+    case messageDetails(messageID: String)
     case chatDetails(chatID: String)
     case recentMessages(chatID: String, pageToken: String? = nil, pageSize: Int = 20, end: String? = nil)
     case threadMessages(threadID: String, pageToken: String? = nil, pageSize: Int = 50)
@@ -50,6 +51,7 @@ public enum ReadOnlyCommand: Equatable, Sendable {
         case .recentChats: "im.chat_list"
         case .searchChats: "im.chat_search"
         case .searchMessages: "im.message_search"
+        case .messageDetails: "im.message_details"
         case .chatDetails: "im.chat_details"
         case .recentMessages: "im.recent_messages"
         case .threadMessages: "im.thread_messages"
@@ -111,6 +113,11 @@ public enum ReadOnlyCommand: Equatable, Sendable {
             ]
             try appendPageToken(pageToken, to: &arguments)
             return arguments
+
+        case let .messageDetails(messageID):
+            try validateMessageID(messageID)
+            return ["im", "+messages-mget", "--as", "user", "--message-ids", messageID,
+                    "--no-reactions", "--format", "json"]
 
         case let .chatDetails(chatID):
             try validateChatID(chatID)

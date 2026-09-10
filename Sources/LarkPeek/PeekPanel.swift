@@ -457,6 +457,7 @@ private struct PeekPanelView: View {
         case .waiting: "waiting"
         case .loading: "loading-\(model.timeline.id)"
         case .candidates: "candidates"
+        case .threadCandidates: "threadCandidates"
         case .messages: "messages-\(model.timeline.id)"
         case .error: "error"
         }
@@ -522,6 +523,28 @@ private struct PeekPanelView: View {
             loadingView(conversation)
         case let .candidates(conversation, chats):
             candidateView(conversation, chats: chats)
+        case let .threadCandidates(conversation, candidates, complete):
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(complete ? "请选择要预览的话题" : "查询范围有限，请确认话题")
+                        .font(.headline)
+                    Text("暂时无法唯一确认，请核对群聊和消息内容。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    ForEach(candidates) { candidate in
+                        Button {
+                            Task { await model.selectThread(candidate, conversation: conversation) }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(candidate.chat.name).font(.headline)
+                                Text(candidate.root.sender.name + " · " + candidate.root.createTime.formatted())
+                                    .font(.caption).foregroundStyle(.secondary)
+                                Text(ThreadText.displayText(candidate.root.content)).font(.body).lineLimit(3)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                        }.buttonStyle(.plain).modifier(HoverBackground(cornerRadius: 9))
+                    }
+                }.padding(20)
+            }
         case let .messages(conversation, _, messages, _):
             VStack(spacing: 0) {
                 if let notice = model.previewNotice {
@@ -624,7 +647,7 @@ private struct PeekPanelView: View {
         switch model.state {
         case .waiting: "Lark Peek"
         case let .loading(conversation): conversation.name
-        case let .candidates(conversation, _): conversation.name
+        case let .candidates(conversation, _), let .threadCandidates(conversation, _, _): conversation.name
         case let .messages(_, chat, _, _): chat.name
         case .error: "Lark Peek"
         }
