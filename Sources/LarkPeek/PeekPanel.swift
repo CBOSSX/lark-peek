@@ -801,8 +801,8 @@ private struct ImageLightboxView: View {
 
     private var geometryAnimation: Animation {
         presentation.isExpanded
-            ? .spring(response: 0.3, dampingFraction: 0.86, blendDuration: 0.04)
-            : .timingCurve(0.4, 0, 0.8, 0.2, duration: 0.2)
+            ? .spring(response: 0.375, dampingFraction: 0.86, blendDuration: 0.04)
+            : .timingCurve(0.4, 0, 0.8, 0.2, duration: 0.25)
     }
 
     var body: some View {
@@ -811,7 +811,7 @@ private struct ImageLightboxView: View {
                 Color.black.opacity(presentation.isExpanded ? 0.82 : 0)
                     .contentShape(Rectangle())
                     .animation(
-                        presentation.isExpanded ? .easeOut(duration: 0.18) : .easeIn(duration: 0.14),
+                        presentation.isExpanded ? .easeOut(duration: 0.225) : .easeIn(duration: 0.175),
                         value: presentation.isExpanded
                     )
             }
@@ -837,12 +837,7 @@ private struct ImageLightboxView: View {
                 .padding(7)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                 .opacity(presentation.isExpanded ? 0 : 1)
-                .animation(.easeOut(duration: 0.1), value: presentation.isExpanded)
-                .allowsHitTesting(false)
-
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .stroke(Color.white.opacity(0.08), lineWidth: 1)
-                .opacity(presentation.isExpanded ? 0 : 1)
+                .animation(.easeOut(duration: 0.125), value: presentation.isExpanded)
                 .allowsHitTesting(false)
 
             VStack {
@@ -865,8 +860,8 @@ private struct ImageLightboxView: View {
             .opacity(presentation.isExpanded ? 1 : 0)
             .animation(
                 presentation.isExpanded
-                    ? .spring(response: 0.26, dampingFraction: 0.82).delay(0.06)
-                    : .easeOut(duration: 0.08),
+                    ? .spring(response: 0.325, dampingFraction: 0.82).delay(0.075)
+                    : .easeOut(duration: 0.1),
                 value: presentation.isExpanded
             )
         }
@@ -887,8 +882,8 @@ private final class ImagePreviewPresentation: ObservableObject {
 private final class ImagePreviewPanelController {
     private static let maximumSize = CGSize(width: 1_200, height: 900)
     private static let screenFraction: CGFloat = 0.86
-    private static let expansionDuration: TimeInterval = 0.28
-    private static let collapseDuration: TimeInterval = 0.2
+    private static let expansionDuration: TimeInterval = 0.35
+    private static let collapseDuration: TimeInterval = 0.25
     private static let expansionTiming = CAMediaTimingFunction(
         controlPoints: 0.16, 0.9, 0.22, 1
     )

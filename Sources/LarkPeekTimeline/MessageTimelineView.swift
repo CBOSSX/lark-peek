@@ -304,15 +304,13 @@ private struct MessageBodyView: View {
     private func messageImage(_ image: MessageImage) -> some View {
         ZStack(alignment: .leading) {
             if let data = image.data, let decodedImage = NSImage(data: data) {
+                let size = decodedImage.size
+                let scale = min(300 / max(size.width, 1), 180 / max(size.height, 1))
                 Image(nsImage: decodedImage)
                     .resizable()
                     .scaledToFit()
-                    .frame(maxWidth: 300, maxHeight: 180)
+                    .frame(width: max(size.width, 1) * scale, height: max(size.height, 1) * scale)
                     .clipShape(RoundedRectangle(cornerRadius: 9))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 9)
-                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
-                    }
                     .overlay(alignment: .bottomTrailing) {
                         Image(systemName: "arrow.up.left.and.arrow.down.right")
                             .font(.system(size: 9, weight: .semibold))
@@ -348,21 +346,24 @@ private struct MessageBodyView: View {
                     .accessibilityAction {
                         openImage(decodedImage, key: image.key, localClickLocation: nil)
                     }
-            } else if image.attempted {
-                Label("图片暂不可用", systemImage: "photo.badge.exclamationmark")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
             } else {
-                HStack(spacing: 7) {
-                    ProgressView().controlSize(.small)
-                    Text("正在加载图片…")
+                Group {
+                    if image.attempted {
+                        Label("图片暂不可用", systemImage: "photo.badge.exclamationmark")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        HStack(spacing: 7) {
+                            ProgressView().controlSize(.small)
+                            Text("正在加载图片…")
+                        }
+                        .foregroundStyle(.secondary)
+                    }
                 }
                 .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+                .frame(maxWidth: 300, alignment: .leading)
+                .frame(height: 180)
             }
         }
-        .frame(maxWidth: 300, alignment: .leading)
-        .frame(height: 180)
         .clipped()
     }
 
