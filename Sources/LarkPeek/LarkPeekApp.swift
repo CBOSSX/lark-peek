@@ -274,11 +274,11 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         if !panelController.contains(point) { closePeek(reason: "outside_click") }
     }
 
-    private func showConversation(_ conversation: HoveredConversation, triggerID: String, preservePosition: Bool = false) {
+    private func showConversation(_ conversation: HoveredConversation, triggerID: String) {
         peekTask?.cancel()
         model.invalidatePreviewRequests()
         activeTriggerID = triggerID
-        panelController.show(anchor: conversation.rowFrame, triggerID: triggerID, preservePosition: preservePosition)
+        panelController.show(anchor: conversation.rowFrame, triggerID: triggerID)
         peekTask = Task { [weak self] in
             guard !Task.isCancelled else { return }
             await LarkPeekDiagnostics.$triggerID.withValue(triggerID) { await self?.model.peek(conversation) }
@@ -303,7 +303,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
                 let triggerID = LarkPeekDiagnostics.makeTriggerID()
                 let conversation = try? self.hoverResolver.resolveCurrentConversation(triggerID: triggerID)
                 if let next = self.hoverTracker.observe(conversation, at: time) {
-                    self.showConversation(next, triggerID: triggerID, preservePosition: true)
+                    self.showConversation(next, triggerID: triggerID)
                 }
             }
         }

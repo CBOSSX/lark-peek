@@ -125,12 +125,15 @@ final class PeekPanelController {
     var frame: CGRect { lastCardFrame }
 
     private var lastCardFrame: CGRect = .zero
+    private var movementTask: Task<Void, Never>?
     private var lastTriggerID: String?
     private var presentationGeneration = UUID()
     private var presentationCursorInLayer = CGPoint.zero
 
-    func show(anchor axFrame: CGRect, triggerID: String, preservePosition: Bool = false, cursorLocation: CGPoint? = nil) {
+    func show(anchor axFrame: CGRect, triggerID: String, cursorLocation: CGPoint? = nil) {
         dismissPresentedImage()
+        movementTask?.cancel()
+        movementTask = nil
         closeTask?.cancel()
         closeTask = nil
         lastTriggerID = triggerID
@@ -139,12 +142,12 @@ final class PeekPanelController {
         presentation.searchOrigin = nil
         presentation.isShowingSearchContext = false
         search.clear()
-        if preservePosition, panel.isVisible, !lastCardFrame.isEmpty {
-            presentation.isPresented = true
-            return
-        }
         presentation.isPinned = false
         let cardFrame = CGRect(origin: origin(for: axFrame, panelSize: Self.cardSize), size: Self.cardSize)
+        if panel.isVisible, presentation.isPresented {
+            moveCard(to: cardFrame)
+            return
+        }
         lastCardFrame = cardFrame
         let anchor = cursorPoint(cursorLocation ?? NSEvent.mouseLocation, relativeTo: cardFrame)
         presentation.appearAnchor = anchor
@@ -220,6 +223,33 @@ final class PeekPanelController {
         return transform
     }
 
+    /// Translate the existing window without resizing or remeasuring its timeline.
+    /// A new target starts from the current frame, including during an unfinished move.
+    private func moveCard(to target: CGRect) {
+        let start = lastCardFrame
+        let windowOrigin = panel.frame.origin
+        let delta = CGPoint(x: target.minX - start.minX, y: target.minY - start.minY)
+        guard delta != .zero else { return }
+        let duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0.0 : 0.26
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        movementTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let progress = duration == 0 ? 1 : min(1, (ProcessInfo.processInfo.systemUptime - startedAt) / duration)
+                // Cubic ease-out: quick departure and a gentle landing, without overshoot.
+                let eased = 1 - pow(1 - progress, 3)
+                let offset = CGPoint(x: delta.x * eased, y: delta.y * eased)
+                self.panel.setFrameOrigin(CGPoint(x: windowOrigin.x + offset.x, y: windowOrigin.y + offset.y))
+                self.lastCardFrame = start.offsetBy(dx: offset.x, dy: offset.y)
+                if progress >= 1 {
+                    self.movementTask = nil
+                    return
+                }
+                do { try await Task.sleep(for: .milliseconds(8)) } catch { return }
+            }
+        }
+    }
+
     private func animatePresentation(generation: UUID) {
         presentation.isPresented = true
         animatePresentationLayer(show: true) { [weak self] in
@@ -292,6 +322,8 @@ final class PeekPanelController {
     }
 
     func close(triggerID: String? = nil, reason: String = "panel_control") {
+        movementTask?.cancel()
+        movementTask = nil
         dismissPresentedImage()
         model.invalidatePreviewRequests()
         search.cancel()
@@ -343,6 +375,10 @@ final class PeekPanelController {
 
     func setPinned(_ pinned: Bool) {
         guard panel.isVisible, closeTask == nil else { return }
+        if pinned {
+            movementTask?.cancel()
+            movementTask = nil
+        }
         presentation.isPinned = pinned
         // Pinning only changes dismissal behavior, exactly like Control + Option + P.
         onPinChanged?()

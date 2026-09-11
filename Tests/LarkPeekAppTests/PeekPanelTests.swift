@@ -423,21 +423,42 @@ struct PeekPanelTests {
         try await Task.sleep(for: .milliseconds(300))
     }
 
-    @Test func scanningKeepsTheCardStationaryAndPinningPreservesTheSession() async throws {
+    @Test func scanningMovesTheCardToTheNewRowAndPinningPreservesTheSession() async throws {
         _ = NSApplication.shared
         let model = PeekModel()
         let controller = PeekPanelController(model: model)
         controller.showPreviewFixture(anchor: CGRect(x: 50, y: 100, width: 300, height: 60))
-        await Task.yield()
+        for _ in 0..<100 where model.isPresentingPreview {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(!model.isPresentingPreview)
         let initialFrame = controller.frame
         let sessionID = model.timeline.id
-        controller.show(anchor: CGRect(x: 50, y: 200, width: 300, height: 60), triggerID: "switch", preservePosition: true)
+        controller.show(anchor: CGRect(x: 50, y: 200, width: 300, height: 60), triggerID: "switch")
         #expect(controller.frame == initialFrame)
+        try await Task.sleep(for: .milliseconds(70))
+        let intermediateFrame = controller.frame
+        #expect(intermediateFrame.origin != initialFrame.origin)
+        #expect(controller.contains(CGPoint(x: intermediateFrame.midX, y: intermediateFrame.midY)))
+        try await Task.sleep(for: .milliseconds(300))
+        let switchedFrame = controller.frame
+        #expect(intermediateFrame.origin != switchedFrame.origin)
+        #expect(switchedFrame.origin != initialFrame.origin)
+        #expect(switchedFrame.size == initialFrame.size)
+        #expect(controller.isVisible)
+        #expect(!model.isPresentingPreview)
+        controller.show(anchor: CGRect(x: 50, y: 100, width: 300, height: 60), triggerID: "reverse")
+        try await Task.sleep(for: .milliseconds(70))
+        let interruptedFrame = controller.frame
+        controller.show(anchor: CGRect(x: 50, y: 200, width: 300, height: 60), triggerID: "retarget")
+        #expect(controller.frame == interruptedFrame)
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(abs(controller.frame.minY - switchedFrame.minY) < 0.01)
         controller.setPinned(true)
         #expect(controller.isPinned)
-        #expect(controller.frame == initialFrame)
+        #expect(controller.frame == switchedFrame)
         #expect(model.timeline.id == sessionID)
-        #expect(controller.contains(CGPoint(x: initialFrame.midX, y: initialFrame.midY)))
+        #expect(controller.contains(CGPoint(x: switchedFrame.midX, y: switchedFrame.midY)))
         let window = controller.window
         #expect(!window.styleMask.contains(.resizable))
         #expect(model.timeline.id == sessionID)
