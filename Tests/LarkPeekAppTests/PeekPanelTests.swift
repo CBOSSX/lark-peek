@@ -2,7 +2,7 @@ import AppKit
 import QuartzCore
 import SwiftUI
 import Testing
-import LarkPeekCore
+@testable import LarkPeekCore
 import ImageIO
 import UniformTypeIdentifiers
 @testable import LarkPeek
@@ -178,6 +178,57 @@ struct PeekPanelTests {
                     #expect(abs(reopened.screenY - original.screenY) <= 0.5)
                 }
             }
+        }
+        controller.close()
+        try await Task.sleep(for: .milliseconds(300))
+    }
+
+    @Test func searchNavigationKeepsLargeTimelineGeometryStable() async throws {
+        _ = NSApplication.shared
+        let model = PeekModel()
+        model.showPreviewFixture()
+        let chat = try #require(model.timeline.chat)
+        let conversation = try #require(model.timeline.conversation)
+        let messages = (0..<250).map { index in
+            LarkMessage(id: "om_navigation_\(index)", chatID: chat.id, createTime: Date(timeIntervalSince1970: Double(index)),
+                sender: MessageSender(name: "测试同事"), content: "第 \(index) 条消息：" + String(repeating: "搜索切换时保持阅读位置。", count: 5))
+        }
+        model.timeline.install(conversation: conversation, chat: chat, messages: messages, cursor: nil, sessionID: model.timeline.id)
+        let controller = PeekPanelController(model: model)
+        controller.show(anchor: CGRect(x: 50, y: 100, width: 300, height: 60), triggerID: "search-geometry")
+        let host = try #require(controller.window.contentView)
+        func layout() {
+            host.layoutSubtreeIfNeeded()
+            controller.window.displayIfNeeded()
+        }
+        func collection(in view: NSView) -> NSCollectionView? {
+            if let collection = view as? NSCollectionView { return collection }
+            return view.subviews.lazy.compactMap { collection(in: $0) }.first
+        }
+        layout()
+        try await Task.sleep(for: .milliseconds(700))
+        layout()
+        let list = try #require(collection(in: host))
+        let scroll = try #require(list.enclosingScrollView)
+        scroll.contentView.scroll(to: CGPoint(x: 0, y: 340))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        let bounds = scroll.contentView.bounds
+        let position = model.readingState.position
+        for _ in 0..<2 {
+            controller.showSearch(currentChat: chat, anchor: .zero)
+            for _ in 0..<25 {
+                layout()
+                #expect(scroll.contentView.bounds == bounds)
+                try await Task.sleep(for: .milliseconds(16))
+            }
+            controller.goBack()
+            for _ in 0..<25 {
+                layout()
+                #expect(scroll.contentView.bounds == bounds)
+                try await Task.sleep(for: .milliseconds(16))
+            }
+            #expect(collection(in: host) === list)
+            #expect(model.readingState.position == position)
         }
         controller.close()
         try await Task.sleep(for: .milliseconds(300))

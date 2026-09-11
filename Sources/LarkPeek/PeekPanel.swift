@@ -487,7 +487,7 @@ final class PeekPanelController {
 private struct PeekPanelView: View {
     @ObservedObject var model: PeekModel
     @ObservedObject var presentation: PanelPresentation
-    @ObservedObject var search: MessageSearchModel
+    let search: MessageSearchModel
     let onClose: () -> Void
     let onPin: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -642,6 +642,9 @@ private struct PeekPanelView: View {
             .help("关闭（Esc）")
             .accessibilityLabel("关闭预览")
         }
+        // Reserve the back button's height even at the navigation root. Changing
+        // the viewport height makes the native timeline relayout every animation frame.
+        .frame(height: 32)
         .padding(.horizontal, 16)
         .padding(.vertical, 13)
     }
