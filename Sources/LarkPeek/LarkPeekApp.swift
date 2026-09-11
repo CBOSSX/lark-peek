@@ -46,6 +46,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
             if self.isOptionPeekActive { self.startHoverScan() }
             else if !self.panelController.isPinned { self.closePeek(reason: "unpin_without_option") }
         }
+        panelController.onAuthorize = { [weak self] in self?.authorizeLark() }
         panelController.onSearch = { [weak self] in self?.showSearchFromPreview() }
         panelController.onSearchResult = { [weak self] hit in self?.previewSearchHit(hit) }
         model.$statusMessage
@@ -393,10 +394,13 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
     }
 
     @objc private func authorizeLark() {
-        authorizationTask?.cancel()
+        guard authorizationTask == nil else { return }
         authorizationTask = Task { [weak self] in
             guard let self else { return }
             await self.model.authorize { NSWorkspace.shared.open($0) }
+            if self.model.authStatus.state == .ready, self.panelController.isVisible {
+                await self.panelController.retryAfterAuthorization()
+            }
             self.authorizationTask = nil
         }
     }

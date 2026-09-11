@@ -20,6 +20,7 @@ public enum PeekState: Equatable {
 public final class PeekModel: ObservableObject {
     @Published public private(set) var state: PeekState = .waiting
     @Published public private(set) var authStatus = AuthStatus()
+    @Published public private(set) var isAuthorizing = false
     @Published public private(set) var cliPath: String?
     @Published public private(set) var statusMessage = "正在准备只读预览…"
     @Published public var isPresentingPreview = false
@@ -67,7 +68,9 @@ public final class PeekModel: ObservableObject {
     }
 
     public func authorize(openVerificationURL: (URL) -> Bool) async {
-        guard let client else { return }
+        guard let client, !isAuthorizing else { return }
+        isAuthorizing = true
+        defer { isAuthorizing = false }
         let missingScopes = authStatus.missingRequiredScopes
         guard !missingScopes.isEmpty else {
             await verifyAndPrewarm()
@@ -531,11 +534,30 @@ public final class PeekModel: ObservableObject {
         await verifyAndPrewarm()
     }
 
+    func handleAuthorizationFailure(_ error: LarkCLIError) {
+        guard case let .authorization(message, missingScopes) = error else { return }
+        // An expired credential invalidates the previously cached scope grant.
+        let missing = Set(missingScopes).intersection(AuthStatus.requiredScopes)
+        if missing.isEmpty {
+            authStatus.scopes = []
+        } else {
+            authStatus.scopes.subtract(missing)
+        }
+        authStatus.state = .needsLogin
+        previewCache.removeAll()
+        statusMessage = "飞书授权已失效或权限不足，请重新授权。" + message
+    }
+
     private func configureClient() {
         previewCache.removeAll()
         let selected = defaults.string(forKey: "selectedLarkCLIPath").map(URL.init(fileURLWithPath:))
         do {
-            let resolved = try LarkCLIClient(executableURL: selected, workingDirectory: workingDirectory)
+            let resolved = try LarkCLIClient(
+                executableURL: selected, workingDirectory: workingDirectory,
+                onAuthorizationFailure: { [weak self] error in
+                    self?.handleAuthorizationFailure(error)
+                }
+            )
             client = resolved
             cliPath = resolved.cliURL.path
             statusMessage = "只读预览已就绪"
@@ -578,8 +600,12 @@ public final class PeekModel: ObservableObject {
                 "event=prewarm_succeeded chats=\(self.recentChats.count)"
             )
         } catch {
-            authStatus = AuthStatus(state: .error(error.localizedDescription))
-            statusMessage = error.localizedDescription
+            if let cliError = error as? LarkCLIError, case .authorization = cliError {
+                handleAuthorizationFailure(cliError)
+            } else {
+                authStatus = AuthStatus(state: .error(error.localizedDescription))
+                statusMessage = error.localizedDescription
+            }
             LarkPeekDiagnostics.lifecycle.error(
                 "event=prewarm_failed code=\(LarkPeekDiagnostics.errorKind(error), privacy: .public) error=\(error.localizedDescription, privacy: .private)"
             )

@@ -87,6 +87,13 @@ final class PeekPanelController {
         installContentView()
     }
 
+    var onAuthorize: (() -> Void)?
+
+    func retryAfterAuthorization() async {
+        if presentation.isSearching { search.retry() }
+        else { await model.retryCurrent() }
+    }
+
     private func installContentView() {
         let hostingView = CardHostingView(rootView: PeekPanelView(
             model: model,
@@ -105,6 +112,10 @@ final class PeekPanelController {
             },
             onRetry: { [weak model] in
                 Task { @MainActor in await model?.retryCurrent() }
+            },
+            onAuthorize: { [weak self] in
+                self?.setPinned(true)
+                self?.onAuthorize?()
             },
             onOpenImage: { [weak self] item in self?.showPresentedImage(item) }
         ))
@@ -532,33 +543,90 @@ private struct PeekPanelView: View {
     let onSearch: () -> Void
     let onSelect: (LarkChat, HoveredConversation) -> Void
     let onRetry: () -> Void
+    let onAuthorize: () -> Void
     let onOpenImage: (PresentedImage) -> Void
 
     private let cardShape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+
+    private var needsAuthorization: Bool {
+        model.authStatus.state == .needsLogin || model.isAuthorizing
+    }
+
+    private var showsAuthorizationPage: Bool {
+        guard needsAuthorization, !presentation.isSearching else { return false }
+        if case let .messages(_, _, messages, _) = model.state { return messages.isEmpty }
+        return true
+    }
+
+    private var authorizationPage: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "lock.shield")
+                .font(.system(size: 36))
+                .foregroundStyle(Color.accentColor)
+            Text(model.isAuthorizing ? "正在授权飞书只读访问" : "授权后即可查看消息")
+                .font(.system(size: 18, weight: .semibold))
+            Text(model.statusMessage)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 320)
+            if model.isAuthorizing {
+                ProgressView().controlSize(.small)
+            } else {
+                Button("重新授权", action: onAuthorize)
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("peek-reauthorize-button")
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityIdentifier("peek-authorization-page")
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             header
             hairline
-            ZStack {
-                content
-                    .id(stateKey)
-                    .transition(.opacity)
-                    .opacity(presentation.isSearching ? 0 : 1)
-                    .offset(x: presentation.isSearching && !reduceMotion ? -24 : 0)
-                    .allowsHitTesting(!presentation.isSearching)
-                    .accessibilityHidden(presentation.isSearching)
-                if let searchSessionID = presentation.searchSessionID {
-                    MessageSearchView(model: search, currentChat: presentation.searchChat, isActive: presentation.isSearching, onSelect: onSearchResult)
-                        .id(searchSessionID)
-                        .opacity(presentation.isSearching ? 1 : 0)
-                        .offset(x: presentation.isSearching || reduceMotion ? 0 : 24)
-                        .allowsHitTesting(presentation.isSearching)
-                        .accessibilityHidden(!presentation.isSearching)
-                        .transition(.opacity)
+            if needsAuthorization && !showsAuthorizationPage {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(model.isAuthorizing ? "正在授权飞书只读访问" : "需要重新授权飞书只读访问")
+                        .font(.headline)
+                    Text(model.statusMessage)
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(3)
+                    if model.isAuthorizing {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Button("重新授权", action: onAuthorize)
+                            .accessibilityIdentifier("peek-reauthorize-button")
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(16)
+                hairline
             }
-            .clipped()
+            if showsAuthorizationPage {
+                authorizationPage
+            } else {
+                ZStack {
+                    content
+                        .id(stateKey)
+                        .transition(.opacity)
+                        .opacity(presentation.isSearching ? 0 : 1)
+                        .offset(x: presentation.isSearching && !reduceMotion ? -24 : 0)
+                        .allowsHitTesting(!presentation.isSearching)
+                        .accessibilityHidden(presentation.isSearching)
+                    if let searchSessionID = presentation.searchSessionID {
+                        MessageSearchView(model: search, currentChat: presentation.searchChat, isActive: presentation.isSearching, onSelect: onSearchResult)
+                            .id(searchSessionID)
+                            .opacity(presentation.isSearching ? 1 : 0)
+                            .offset(x: presentation.isSearching || reduceMotion ? 0 : 24)
+                            .allowsHitTesting(presentation.isSearching)
+                            .accessibilityHidden(!presentation.isSearching)
+                            .transition(.opacity)
+                    }
+                }
+                .clipped()
+            }
         }
         .animation(reduceMotion ? .easeOut(duration: 0.12) : .spring(response: 0.3, dampingFraction: 0.9), value: presentation.isSearching)
         .animation(.easeOut(duration: reduceMotion ? 0.12 : 0.2), value: stateKey)

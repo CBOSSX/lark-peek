@@ -34,10 +34,14 @@ private final class RequestCancellationState: @unchecked Sendable {
 
 public actor LarkCLIClient {
     public nonisolated let cliURL: URL
+    private let onAuthorizationFailure: (@MainActor @Sendable (LarkCLIError) -> Void)?
     private let installation: LarkCLIInstallation
     private let workingDirectory: URL
 
-    public init(executableURL: URL? = nil, workingDirectory: URL? = nil, resolver: LarkCLIResolver = LarkCLIResolver()) throws {
+    public init(executableURL: URL? = nil, workingDirectory: URL? = nil, resolver: LarkCLIResolver = LarkCLIResolver(),
+        onAuthorizationFailure: (@MainActor @Sendable (LarkCLIError) -> Void)? = nil
+    ) throws {
+        self.onAuthorizationFailure = onAuthorizationFailure
         let installation = try resolver.resolve(preferredCLIURL: executableURL)
         self.installation = installation
         self.cliURL = installation.cliURL
@@ -49,8 +53,16 @@ public actor LarkCLIClient {
     }
 
     public func run(_ command: ReadOnlyCommand) async throws -> CLIResult {
-        try await run(commandName: command.diagnosticName) {
-            try command.arguments()
+        do {
+            return try await run(commandName: command.diagnosticName) {
+                try command.arguments()
+            }
+        } catch {
+            if !Task.isCancelled, let cliError = error as? LarkCLIError,
+               case .authorization = cliError {
+                await onAuthorizationFailure?(cliError)
+            }
+            throw error
         }
     }
 

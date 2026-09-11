@@ -9,6 +9,29 @@ import UniformTypeIdentifiers
 
 @Suite(.serialized) @MainActor
 struct PeekPanelTests {
+    @Test(arguments: [false, true])
+    func runtimeAuthorizationPromptRendersInThePanel(initialFailure: Bool) async throws {
+        _ = NSApplication.shared
+        let model = PeekModel()
+        let controller = PeekPanelController(model: model)
+        if initialFailure { model.presentError("登录凭证已过期") }
+        else { model.showPreviewFixture() }
+        model.handleAuthorizationFailure(.authorization(message: "登录凭证已过期", missingScopes: []))
+        controller.show(anchor: CGRect(x: 50, y: 100, width: 300, height: 60), triggerID: "auth-test")
+        controller.setPinned(true)
+        defer { controller.close() }
+        try await Task.sleep(for: .milliseconds(500))
+        let host = try #require(controller.window.contentView)
+        host.layoutSubtreeIfNeeded()
+        controller.window.displayIfNeeded()
+        #expect(model.authStatus.state == .needsLogin)
+        let bitmap = try #require(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+        host.cacheDisplay(in: host.bounds, to: bitmap)
+        let png = try #require(bitmap.representation(using: .png, properties: [:]))
+        let filename = initialFailure ? "lark-peek-initial-authorization.png" : "lark-peek-runtime-authorization.png"
+        try png.write(to: URL(fileURLWithPath: "/tmp/" + filename))
+    }
+
     @Test func presentationScaleKeepsTheMouseStationaryWithTheActualHostingLayerAnchor() async throws {
         _ = NSApplication.shared
         let model = PeekModel()
