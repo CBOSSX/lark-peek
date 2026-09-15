@@ -118,7 +118,14 @@ struct MessageSearchView: View {
                 }
                 Spacer()
                 if let url = LarkAppLink.chat(hit.chat.id) {
-                    Button("打开飞书") { NSWorkspace.shared.open(url) }
+                    Button("打开飞书") {
+                        if let desktopURL = LarkAppLink.desktopChat(hit.chat.id),
+                           NSWorkspace.shared.urlForApplication(toOpen: desktopURL) != nil,
+                           NSWorkspace.shared.open(desktopURL) {
+                            return
+                        }
+                        NSWorkspace.shared.open(url)
+                    }
                 }
             }.buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(Color.accentColor)
         }

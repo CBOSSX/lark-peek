@@ -32,6 +32,8 @@ import Testing
     #expect(newer.suffix(4) == ["--start", end, "--page-token", "later"])
     #expect(throws: (any Error).self) { try ReadOnlyCommand.recentMessages(chatID: "oc_safe", start: "--yes").arguments() }
     #expect(LarkAppLink.chat("oc_safe&openId=bad") == nil)
+    #expect(LarkAppLink.desktopChat("oc_safe&openId=bad") == nil)
+    #expect(LarkAppLink.desktopChat("oc_safe")?.absoluteString == "lark://applink.feishu.cn/client/chat/open?openChatId=oc_safe")
     #expect(LarkAppLink.chat("oc_safe")?.absoluteString == "https://applink.feishu.cn/client/chat/open?openChatId=oc_safe")
 }
 
