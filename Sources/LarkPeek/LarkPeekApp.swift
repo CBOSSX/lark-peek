@@ -5,7 +5,14 @@ import LarkPeekCore
 @main
 @MainActor
 final class LarkPeekApp: NSObject, NSApplicationDelegate {
-    private let model = PeekModel()
+    private let settings = PeekSettings()
+    private lazy var model = PeekModel(settings: settings)
+    private lazy var settingsController = SettingsWindowController(
+        settings: settings, model: model,
+        onAuthorize: { [weak self] in self?.authorizeLark() },
+        onCheckAccessibility: { [weak self] in self?.requestAccessibility() },
+        onSelectCLI: { [weak self] in self?.selectCLI() }
+    )
     private let hoverResolver = HoveredConversationResolver()
     private lazy var panelController = PeekPanelController(model: model)
     private var statusItem: NSStatusItem?
@@ -42,7 +49,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
             self.optionHoldTask = nil
             self.hoverScanTask?.cancel()
             self.isOptionHeld = NSEvent.modifierFlags.contains(.option)
-            self.isOptionPeekActive = !self.panelController.isPinned && self.isOptionHeld
+            self.isOptionPeekActive = self.settings.optionHoverEnabled && !self.panelController.isPinned && self.isOptionHeld
             if self.isOptionPeekActive { self.startHoverScan() }
             else if !self.panelController.isPinned { self.closePeek(reason: "unpin_without_option") }
         }
@@ -54,6 +61,21 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
             .sink { [weak self] _ in self?.rebuildMenu() }
             .store(in: &subscriptions)
 
+        settings.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.rebuildMenu()
+                self.optionHoldTask?.cancel()
+                self.optionHoldTask = nil
+                if !self.settings.optionHoverEnabled {
+                    self.isOptionHeld = false
+                    if self.isOptionPeekActive { self.closePeek(reason: "hover_disabled") }
+                }
+            }
+            .store(in: &subscriptions)
+
+        if ProcessInfo.processInfo.arguments.contains("--settings") { showSettings() }
         if ProcessInfo.processInfo.arguments.contains("--preview-fixtures") {
             panelController.showPreviewFixture(anchor: previewAnchor())
         } else {
@@ -88,6 +110,9 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
+        let settingsItem = appMenu.addItem(withTitle: "设置…", action: #selector(showSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "退出 Lark Peek", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
         menu.addItem(appItem)
@@ -112,13 +137,12 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         let status = NSMenuItem(title: model.statusMessage, action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
-        let guide = NSMenuItem(title: "悬停会话后：长按 ⌥，或按 ⌃⌥P", action: nil, keyEquivalent: "")
+        let guide = NSMenuItem(title: settings.optionHoverEnabled ? "悬停会话后：长按 ⌥，或按 \(settings.previewShortcut.label)" : "悬停会话后：按 \(settings.previewShortcut.label)", action: nil, keyEquivalent: "")
         guide.isEnabled = false
         menu.addItem(guide)
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "搜索消息…（⌃⌥F）", action: #selector(showSearch), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "检查辅助功能权限…", action: #selector(requestAccessibility), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "选择 lark-cli…", action: #selector(selectCLI), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "搜索消息…（\(settings.searchShortcut.label)）", action: #selector(showSearch), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "设置…", action: #selector(showSettings), keyEquivalent: ","))
         if model.authStatus.state == .needsLogin {
             menu.addItem(NSMenuItem(title: "授权飞书只读访问…", action: #selector(authorizeLark), keyEquivalent: ""))
         }
@@ -126,6 +150,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "退出 Lark Peek", action: #selector(quit), keyEquivalent: "q"))
         for item in menu.items { item.target = self }
         statusItem?.menu = menu
+        statusItem?.button?.toolTip = "Lark Peek · \(settings.previewShortcut.label) 预览 · \(settings.searchShortcut.label) 搜索"
     }
 
     private func installEventMonitors() {
@@ -158,28 +183,29 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
     }
 
     private func handleKey(_ event: NSEvent) {
-        guard !event.isARepeat else { return }
+        guard !event.isARepeat, settingsController.window?.isKeyWindow != true else { return }
         if event.keyCode == 53, panelController.isVisible {
             if panelController.dismissPresentedImage() { return }
             closePeek(reason: "escape")
             return
         }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        if event.keyCode == 3, flags == [.control, .option] {
+        if settings.searchShortcut.matches(keyCode: event.keyCode, modifiers: flags) {
             showSearch()
             return
         }
-        guard event.keyCode == 35, flags.contains([.control, .option]) else { return }
+        guard settings.previewShortcut.matches(keyCode: event.keyCode, modifiers: flags) else { return }
         if panelController.isVisible {
             if panelController.isPinned { closePeek(reason: "shortcut_toggle") }
             else { panelController.setPinned(true) }
             return
         }
-        activatePeek(source: "control_option_p", showResolutionErrors: true)
+        activatePeek(source: "preview_shortcut", showResolutionErrors: true)
         panelController.setPinned(true)
     }
 
     private func handleModifierFlags(_ event: NSEvent) {
+        guard settings.optionHoverEnabled, settingsController.window?.isKeyWindow != true else { return }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let conflictingModifiers: NSEvent.ModifierFlags = [.control, .command, .shift]
         let optionOnly = flags.contains(.option) && flags.intersection(conflictingModifiers).isEmpty
@@ -201,7 +227,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
             )
             optionHoldTask?.cancel()
             optionHoldTask = Task { [weak self] in
-                try? await Task.sleep(for: .milliseconds(120))
+                try? await Task.sleep(for: .milliseconds(self?.settings.holdDelay ?? 120))
                 guard !Task.isCancelled, let self, self.isOptionHeld, !self.panelController.isPinned else { return }
                 self.optionHoldTask = nil
                 self.isOptionPeekActive = true
@@ -240,7 +266,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
             _ = hoverResolver.requestAccessibilityPermission()
             panelController.showError(
                 "需要辅助功能权限",
-                detail: "授权后不需要重启飞书。把鼠标停在会话行上，长按 ⌥，或按 ⌃⌥P。",
+                detail: "授权后不需要重启飞书。把鼠标停在会话行上，按 \(settings.previewShortcut.label)。",
                 anchor: cursorAnchor(),
                 triggerID: triggerID
             )
@@ -308,6 +334,12 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    @objc private func showSettings() {
+        closePeek(reason: "open_settings")
+        isOptionHeld = false
+        settingsController.show()
     }
 
     @objc private func showSearch() {

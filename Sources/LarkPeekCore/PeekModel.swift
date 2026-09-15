@@ -47,12 +47,14 @@ public final class PeekModel: ObservableObject {
     private var imageCacheBytes = 0
     private var activeThreadReplyRequestCount = 0
     private var pendingThreadReplyRequests: [CheckedContinuation<Void, Never>] = []
+    private let settings: PeekSettings
     private let defaults: UserDefaults
     private let workingDirectory: URL
 
     private static let maximumImageCacheBytes = 64 * 1_024 * 1_024
 
-    public init(defaults: UserDefaults = .standard, workingDirectory: URL = FileManager.default.temporaryDirectory) {
+    public init(defaults: UserDefaults = .standard, workingDirectory: URL = FileManager.default.temporaryDirectory, settings: PeekSettings? = nil) {
+        self.settings = settings ?? PeekSettings(defaults: defaults)
         self.defaults = defaults
         self.workingDirectory = workingDirectory
         configureClient()
@@ -67,11 +69,29 @@ public final class PeekModel: ObservableObject {
         await verifyAndPrewarm()
     }
 
+    public func checkAuthorization() async {
+        guard !isAuthorizing, authStatus.state != .checking else { return }
+        authStatus.state = .checking
+        statusMessage = "正在检测飞书只读权限…"
+        do {
+            let client = try requireClient()
+            let result = try await client.run(.authStatus)
+            authStatus = try LarkCLIParser.authStatus(from: result.data)
+            statusMessage = authStatus.state == .ready
+                ? "只读预览已就绪 · 飞书权限完整"
+                : "需要补充飞书授权 · 缺少 \(authStatus.missingRequiredScopes.count) 项权限"
+        } catch {
+            authStatus.state = .error(error.localizedDescription)
+            statusMessage = error.localizedDescription
+        }
+    }
+
     public func authorize(openVerificationURL: (URL) -> Bool) async {
         guard let client, !isAuthorizing else { return }
         isAuthorizing = true
         defer { isAuthorizing = false }
-        let missingScopes = authStatus.missingRequiredScopes
+        let missingScopes = authStatus.missingRequiredScopes.isEmpty && authStatus.state == .needsLogin
+            ? Set(AuthStatus.requiredScopes) : authStatus.missingRequiredScopes
         guard !missingScopes.isEmpty else {
             await verifyAndPrewarm()
             return
@@ -593,9 +613,9 @@ public final class PeekModel: ObservableObject {
                     : "还缺少 \(count) 项飞书只读权限"
                 return
             }
-            statusMessage = "正在缓存最近会话索引…"
+            statusMessage = "正在加载最近会话…"
             try await loadFirstChatPage(using: client)
-            statusMessage = "只读预览已就绪 · 已索引最近 \(recentChats.count) 个会话"
+            statusMessage = "只读预览已就绪 · 启动已加载 \(recentChats.count) 个最近会话"
             LarkPeekDiagnostics.lifecycle.notice(
                 "event=prewarm_succeeded chats=\(self.recentChats.count)"
             )
@@ -626,7 +646,8 @@ public final class PeekModel: ObservableObject {
 
     private func findExactByPagingRecentChats(name: String, using client: LarkCLIClient) async throws -> [LarkChat] {
         var token = nextPageToken
-        for _ in 0..<4 {
+        let additionalPages = max(0, settings.indexLimit / 100 - 1)
+        for _ in 0..<additionalPages {
             try Task.checkCancellation()
             guard let pageToken = token else { return [] }
             let result = try await client.run(.recentChats(pageToken: pageToken, pageSize: 100))
