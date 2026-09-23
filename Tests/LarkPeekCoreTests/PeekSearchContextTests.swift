@@ -92,7 +92,8 @@ import Testing
     #expect(model.timeline.messages.map(\.id) == ["om_older", "om_previous"])
     #expect(model.isCachedPreview)
     await model.retryCurrent()
-    #expect(try String(contentsOf: fixture.commands, encoding: .utf8).split(separator: "\n").count == 3)
+    // Refresh fetches the initial page and automatically fills its short batch again.
+    #expect(try String(contentsOf: fixture.commands, encoding: .utf8).split(separator: "\n").count == 4)
     #expect(model.previewNotice == nil)
     #expect(model.readingState !== reading)
 }

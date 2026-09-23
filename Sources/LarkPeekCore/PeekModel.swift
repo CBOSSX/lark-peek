@@ -436,7 +436,7 @@ public final class PeekModel: ObservableObject {
         }.value
     }
 
-    private func performOlderPageLoad(automatic: Bool) async {
+    private func performOlderPageLoad(automatic: Bool, maximumPages: Int = 3, minimumMessageCount: Int? = nil) async {
         let sessionID = timeline.id
         guard let chat = timeline.chat,
               let request = timeline.beginPage(sessionID: sessionID, automatic: automatic) else { return }
@@ -444,7 +444,7 @@ public final class PeekModel: ObservableObject {
         var visited = Set<String>()
         do {
             let client = try requireClient()
-            for attempt in 0..<3 {
+            for attempt in 0..<maximumPages {
                 try timeline.checkCurrentRequest()
                 visited.insert(cursor)
                 let result = try await client.run(.recentMessages(chatID: chat.id, pageToken: cursor, pageSize: 20, end: contextEnd))
@@ -456,9 +456,12 @@ public final class PeekModel: ObservableObject {
                 if let next = page.nextPageToken {
                     if visited.contains(next) || timeline.consumedPageTokens.contains(next) {
                         nextState = .paused(nil, "分页游标没有前进，请重新打开预览")
+                    } else if let minimumMessageCount {
+                        nextState = timeline.messages.count + addedCount >= minimumMessageCount || attempt == maximumPages - 1
+                            ? .ready(next) : .loading(request.id, next)
                     } else if addedCount > 0 {
                         nextState = .ready(next)
-                    } else if attempt == 2 {
+                    } else if attempt == maximumPages - 1 {
                         nextState = .paused(next, "本次未读到更早消息")
                     } else {
                         nextState = .loading(request.id, next)
@@ -690,6 +693,15 @@ public final class PeekModel: ObservableObject {
         }
         timeline.install(conversation: conversation, chat: chat, messages: page.messages, cursor: page.nextPageToken, sessionID: sessionID)
         scheduleEnrichment(using: client)
+        // Show the first page immediately, then fill a short initial batch. Some topic
+        // chats return far fewer messages than the requested page size.
+        if !isCachedPreview, timeline.messages.count < 20 {
+            await timeline.schedule(key: "older-page") { [weak self] in
+                await self?.performOlderPageLoad(automatic: true, maximumPages: 4, minimumMessageCount: 20)
+            }.value
+            try timeline.checkCurrentRequest()
+            saveCachedPreview()
+        }
     }
 
     private func saveCachedPreview() {

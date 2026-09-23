@@ -48,7 +48,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
             self.optionHoldTask?.cancel()
             self.optionHoldTask = nil
             self.hoverScanTask?.cancel()
-            self.isOptionHeld = NSEvent.modifierFlags.contains(.option)
+            self.isOptionHeld = self.settings.optionHoverSide.isHeld(in: NSEvent.modifierFlags)
             self.isOptionPeekActive = self.settings.optionHoverEnabled && !self.panelController.isPinned && self.isOptionHeld
             if self.isOptionPeekActive { self.startHoverScan() }
             else if !self.panelController.isPinned { self.closePeek(reason: "unpin_without_option") }
@@ -68,7 +68,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
                 self.rebuildMenu()
                 self.optionHoldTask?.cancel()
                 self.optionHoldTask = nil
-                if !self.settings.optionHoverEnabled {
+                if !self.settings.optionHoverEnabled || !self.settings.optionHoverSide.isHeld(in: NSEvent.modifierFlags) {
                     self.isOptionHeld = false
                     if self.isOptionPeekActive { self.closePeek(reason: "hover_disabled") }
                 }
@@ -208,8 +208,8 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
         guard settings.optionHoverEnabled, settingsController.window?.isKeyWindow != true else { return }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let conflictingModifiers: NSEvent.ModifierFlags = [.control, .command, .shift]
-        let optionOnly = flags.contains(.option) && flags.intersection(conflictingModifiers).isEmpty
-        let optionKeyCodes: Set<UInt16> = [58, 61]
+        let selectedOptionHeld = settings.optionHoverSide.isHeld(in: event.modifierFlags)
+        let optionOnly = selectedOptionHeld && flags.intersection(conflictingModifiers).isEmpty
 
         if optionOnly {
             guard !panelController.isPinned, !panelController.isSearching else { return }
@@ -219,7 +219,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
             }
             // Only an actual left/right Option key-down starts a hold gesture.
             // Releasing another modifier while Option remains down must not start one.
-            guard optionKeyCodes.contains(event.keyCode) else { return }
+            guard settings.optionHoverSide.isKeyDown(keyCode: event.keyCode, flags: event.modifierFlags) else { return }
             guard !isOptionHeld else { return }
             isOptionHeld = true
             LarkPeekDiagnostics.input.debug(
@@ -238,7 +238,7 @@ final class LarkPeekApp: NSObject, NSApplicationDelegate {
             return
         }
 
-        isOptionHeld = flags.contains(.option)
+        isOptionHeld = selectedOptionHeld
         optionHoldTask?.cancel()
         optionHoldTask = nil
         hoverScanTask?.cancel()

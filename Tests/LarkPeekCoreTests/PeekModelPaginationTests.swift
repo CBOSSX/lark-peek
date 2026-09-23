@@ -4,6 +4,66 @@ import Testing
 
 @MainActor
 struct PeekModelPaginationTests {
+    @Test func dismissingDuringInitialBackfillKeepsThePreviewDismissed() async throws {
+        let fixture = try PaginationFixture()
+        defer { fixture.remove() }
+        try fixture.page("initial", ids: [5], next: "p1")
+        try fixture.page("p1", ids: [4], next: nil)
+        try Data().write(to: fixture.directory.appendingPathComponent("delay-p1"))
+        let model = fixture.model()
+        let load = Task { await model.peek(fixture.conversation) }
+        defer { load.cancel(); model.dismiss() }
+        for _ in 0..<200 {
+            if (try? fixture.requests().contains("p1")) == true { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(try fixture.requests() == ["initial", "p1"])
+        #expect(model.timeline.messages.map(\.id) == ["om_5"])
+        model.dismiss()
+        await load.value
+        #expect(model.state == .waiting)
+        #expect(model.timeline.messages.isEmpty)
+    }
+
+    @Test func shortInitialPagesFillToTwentyUniqueMessagesAndReuseTheCache() async throws {
+        let fixture = try PaginationFixture()
+        defer { fixture.remove() }
+        try fixture.page("initial", ids: [20], next: "p1")
+        try fixture.page("p1", ids: [16, 17, 18, 19, 20], next: "p2")
+        try fixture.page("p2", ids: Array(1...15), next: "p3")
+        let model = fixture.model()
+        defer { model.dismiss() }
+        await model.peek(fixture.conversation)
+        #expect(model.timeline.messages.map(\.id) == (1...20).map { "om_\($0)" })
+        #expect(model.timeline.pagination == .ready("p3"))
+        #expect(try fixture.requests() == ["initial", "p1", "p2"])
+        model.dismiss()
+        await model.peek(fixture.conversation)
+        #expect(model.isCachedPreview)
+        #expect(model.timeline.messages.count == 20)
+        #expect(try fixture.requests().count == 3)
+    }
+
+    @Test func initialBackfillSkipsEmptyPagesAndStopsAtItsRequestBudget() async throws {
+        let fixture = try PaginationFixture()
+        defer { fixture.remove() }
+        try fixture.page("initial", ids: [10], next: "p1")
+        try fixture.page("p1", ids: [], next: "p2")
+        try fixture.page("p2", ids: [10], next: "p3")
+        try fixture.page("p3", ids: [9], next: "p4")
+        try fixture.page("p4", ids: [8], next: "p5")
+        try fixture.page("p5", ids: [7], next: nil)
+        let model = fixture.model()
+        defer { model.dismiss() }
+        await model.peek(fixture.conversation)
+        #expect(model.timeline.messages.map(\.id) == ["om_8", "om_9", "om_10"])
+        #expect(model.timeline.pagination == .ready("p5"))
+        #expect(try fixture.requests() == ["initial", "p1", "p2", "p3", "p4"])
+        await model.loadOlderMessages()
+        #expect(model.timeline.messages.map(\.id) == ["om_7", "om_8", "om_9", "om_10"])
+        #expect(model.timeline.pagination == .exhausted)
+    }
+
     @Test func paginationCompletesWhileAnImageRequestIsStillRunning() async throws {
         let fixture = try PaginationFixture()
         defer { fixture.remove() }
@@ -22,7 +82,7 @@ struct PeekModelPaginationTests {
     @Test func emptyPagesAreBoundedAndRequireExplicitContinuation() async throws {
         let fixture = try PaginationFixture()
         defer { fixture.remove() }
-        try fixture.page("initial", ids: [5], next: "p1")
+        try fixture.page("initial", ids: Array(5...24), next: "p1")
         try fixture.page("p1", ids: [5], next: "p2")
         try fixture.page("p2", ids: [], next: "p3")
         try fixture.page("p3", ids: [5], next: "p4")
@@ -36,7 +96,7 @@ struct PeekModelPaginationTests {
         await model.loadOlderMessages(automatic: true)
         #expect(try fixture.requests().count == 4)
         await model.loadOlderMessages()
-        #expect(model.timeline.messages.map(\.id) == ["om_4", "om_5"])
+        #expect(model.timeline.messages.map(\.id) == (4...24).map { "om_\($0)" })
         #expect(model.timeline.pagination == .exhausted)
     }
 
@@ -47,7 +107,6 @@ struct PeekModelPaginationTests {
         let model = fixture.model()
         defer { model.dismiss() }
         await model.peek(fixture.conversation)
-        await model.loadOlderMessages()
         guard case let .failed(cursor, _) = model.timeline.pagination else {
             Issue.record("Missing page must produce an explicit failure")
             return
@@ -80,7 +139,7 @@ struct PeekModelPaginationTests {
     @Test func cursorCyclesAcrossSuccessfulRequestsAreAlsoStopped() async throws {
         let fixture = try PaginationFixture()
         defer { fixture.remove() }
-        try fixture.page("initial", ids: [5], next: "p1")
+        try fixture.page("initial", ids: Array(5...24), next: "p1")
         try fixture.page("p1", ids: [4], next: "p2")
         try fixture.page("p2", ids: [3], next: "p1")
         let model = fixture.model()
@@ -93,7 +152,7 @@ struct PeekModelPaginationTests {
             Issue.record("Cursor history must span successful requests")
             return
         }
-        #expect(model.timeline.messages.map(\.id) == ["om_3", "om_4", "om_5"])
+        #expect(model.timeline.messages.map(\.id) == (3...24).map { "om_\($0)" })
     }
 }
 
@@ -122,6 +181,7 @@ private struct PaginationFixture {
               shift
             done
             printf '%s\\n' "$token" >> '\(directory.path)/requests'
+            if [ -f '\(directory.path)/delay-'"$token" ]; then /bin/sleep 1; fi
             /bin/cat '\(directory.path)/'"$token".json
             ;;
           *" +messages-resources-download "*)

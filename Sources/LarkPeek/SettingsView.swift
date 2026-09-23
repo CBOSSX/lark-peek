@@ -72,6 +72,11 @@ struct SettingsView: View {
                 }
                 Section {
                     Toggle("长按 Option 预览", isOn: $settings.optionHoverEnabled)
+                    Picker("触发按键", selection: $settings.optionHoverSide) {
+                        ForEach(OptionHoverSide.allCases, id: \.self) { side in
+                            Text(side.label).tag(side)
+                        }
+                    }.disabled(!settings.optionHoverEnabled)
                     HStack {
                         Text("触发延迟")
                         Spacer()
@@ -95,7 +100,7 @@ struct SettingsView: View {
                 } header: {
                     Label("悬停预览", systemImage: "cursorarrow")
                 } footer: {
-                    Text("鼠标停在飞书会话上时生效，松开 Option 即关闭。增大延迟可减少误触。")
+                    Text("鼠标停在飞书会话上时生效，松开所选 Option 键即关闭。增大延迟可减少误触。")
                 }
                 Section {
                     HStack {

@@ -14,15 +14,18 @@ struct PeekSettingsTests {
         #expect(settings.indexLimit == 500)
         #expect(settings.holdDelay == 120)
         #expect(settings.optionHoverEnabled)
+        #expect(settings.optionHoverSide == .either)
         settings.indexLimit = 2_000
         settings.holdDelay = 375
         settings.optionHoverEnabled = false
+        settings.optionHoverSide = .left
         let custom = PeekShortcut(keyCode: 50, modifiers: [.control, .shift])
         #expect(settings.setShortcut(custom, forSearch: false))
         let reloaded = PeekSettings(defaults: defaults)
         #expect(reloaded.indexLimit == 2_000)
         #expect(reloaded.holdDelay == 375)
         #expect(!reloaded.optionHoverEnabled)
+        #expect(reloaded.optionHoverSide == .left)
         #expect(reloaded.previewShortcut == custom)
         reloaded.restoreDefaults()
         let restored = PeekSettings(defaults: defaults)
@@ -30,6 +33,7 @@ struct PeekSettingsTests {
         #expect(restored.previewShortcut == .preview)
         #expect(restored.searchShortcut == .search)
         #expect(restored.optionHoverEnabled)
+        #expect(restored.optionHoverSide == .either)
         #expect(defaults.string(forKey: "selectedLarkCLIPath") == "/custom/lark-cli")
     }
 

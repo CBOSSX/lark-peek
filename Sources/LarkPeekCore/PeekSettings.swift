@@ -61,6 +61,7 @@ public final class PeekSettings: ObservableObject {
     private let defaults: UserDefaults
     @Published public var indexLimit: Int { didSet { defaults.set(indexLimit, forKey: "settings.indexLimit") } }
     @Published public var optionHoverEnabled: Bool { didSet { defaults.set(optionHoverEnabled, forKey: "settings.optionHoverEnabled") } }
+    @Published public var optionHoverSide: OptionHoverSide { didSet { defaults.set(optionHoverSide.rawValue, forKey: "settings.optionHoverSide") } }
     @Published public var holdDelay: Int { didSet { defaults.set(holdDelay, forKey: "settings.holdDelay") } }
     @Published public private(set) var previewShortcut: PeekShortcut
     @Published public private(set) var searchShortcut: PeekShortcut
@@ -72,6 +73,7 @@ public final class PeekSettings: ObservableObject {
         let delay = defaults.integer(forKey: "settings.holdDelay")
         holdDelay = defaults.object(forKey: "settings.holdDelay") != nil && Self.holdDelayRange.contains(delay) ? delay : 120
         optionHoverEnabled = defaults.object(forKey: "settings.optionHoverEnabled") as? Bool ?? true
+        optionHoverSide = OptionHoverSide(rawValue: defaults.string(forKey: "settings.optionHoverSide") ?? "") ?? .either
         func shortcut(_ key: String, fallback: PeekShortcut) -> PeekShortcut {
             guard let data = defaults.data(forKey: key),
                   let value = try? JSONDecoder().decode(PeekShortcut.self, from: data), value.isValid else { return fallback }
@@ -93,6 +95,7 @@ public final class PeekSettings: ObservableObject {
     public func restoreDefaults() {
         indexLimit = 500
         optionHoverEnabled = true
+        optionHoverSide = .either
         holdDelay = 120
         previewShortcut = .preview
         searchShortcut = .search
